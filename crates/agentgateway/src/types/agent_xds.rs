@@ -249,6 +249,7 @@ fn convert_mcp_provider(provider: i32) -> Option<McpIDP> {
 		x if x == proto::agent::backend_policy_spec::mcp_authentication::McpIdp::Keycloak as i32 => {
 			Some(McpIDP::Keycloak {})
 		},
+		// Okta is not yet in the proto enum; standalone config uses YAML directly.
 		_ => None,
 	}
 }

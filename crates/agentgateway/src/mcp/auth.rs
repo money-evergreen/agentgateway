@@ -198,10 +198,12 @@ pub(super) async fn authorization_server_metadata(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	// RFC 8414 URL for standard AS metadata. Keycloak does not implement RFC 8414; it only
-	// exposes OpenID Provider Metadata at {issuer}/.well-known/openid-configuration (OIDC Discovery).
+	// RFC 8414 URL for standard AS metadata. Keycloak and Okta do not implement RFC 8414 at the
+	// standard path; they expose metadata under the issuer path directly.
 	let metadata_uri = match &auth.provider {
-		Some(McpIDP::Keycloak { .. }) => openid_configuration_metadata_url(&auth.issuer),
+		Some(McpIDP::Keycloak { .. }) | Some(McpIDP::Okta { .. }) => {
+			openid_configuration_metadata_url(&auth.issuer)
+		},
 		_ => authorization_server_metadata_url(&auth.issuer),
 	};
 	let ureq = ::http::Request::builder()
@@ -251,6 +253,21 @@ pub(super) async fn authorization_server_metadata(
 			};
 			*re = format!("{current_uri}/client-registration");
 		},
+		Some(McpIDP::Okta { .. }) => {
+			// Okta custom authorization servers embed the audience in the server config,
+			// so no authorization_endpoint patching is needed (unlike Auth0).
+			// Proxy DCR through the gateway for CORS support.
+			let current_uri = req
+				.extensions()
+				.get::<filters::OriginalUrl>()
+				.map(|u| u.0.clone())
+				.unwrap_or_else(|| req.uri().clone());
+			if let Some(serde_json::Value::String(re)) =
+				json::traverse_mut(&mut resp, &["registration_endpoint"])
+			{
+				*re = format!("{current_uri}/client-registration");
+			}
+		},
 		_ => {},
 	}
 
@@ -272,11 +289,20 @@ pub(super) async fn client_registration(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	// Normalize issuer URL by removing trailing slashes to avoid double-slash in path
 	let issuer = auth.issuer.trim_end_matches('/');
+	let dcr_uri = match &auth.provider {
+		Some(McpIDP::Okta { .. }) => {
+			// Okta DCR is at {origin}/oauth2/v1/clients, not under the AS issuer path.
+			match url::Url::parse(issuer) {
+				Ok(parsed) => format!("{}/oauth2/v1/clients", parsed.origin().ascii_serialization()),
+				Err(_) => format!("{issuer}/oauth2/v1/clients"),
+			}
+		},
+		_ => format!("{issuer}/clients-registrations/openid-connect"),
+	};
 	let body = std::mem::take(req.body_mut());
 	let ureq = ::http::Request::builder()
-		.uri(format!("{issuer}/clients-registrations/openid-connect"))
+		.uri(dcr_uri)
 		.method(Method::POST)
 		.body(body)?;
 
