@@ -372,19 +372,39 @@ pub(super) async fn client_registration(
 
 	let ureq = builder.body(body)?;
 
-	let mut upstream = client.simple_call(ureq).await?;
+	let upstream = client.simple_call(ureq).await?;
 
-	// Add CORS headers to the response
-	let headers = upstream.headers_mut();
-	headers.insert("access-control-allow-origin", "*".parse().unwrap());
-	headers.insert(
-		"access-control-allow-methods",
-		"POST, OPTIONS".parse().unwrap(),
-	);
-	headers.insert(
-		"access-control-allow-headers",
-		"content-type".parse().unwrap(),
-	);
+	// For Okta POST responses: strip null fields that break MCP SDK validation.
+	// Okta returns client_uri: null, logo_uri: null which the SDK rejects
+	// (expects string or absent, not null).
+	let response = if matches!(&auth.provider, Some(McpIDP::Okta { .. })) && method == Method::POST {
+		let status = upstream.status();
+		let limit = crate::http::response_buffer_limit(&upstream);
+		let mut resp_json: serde_json::Value = from_body_with_limit(upstream.into_body(), limit)
+			.await
+			.map_err(ProxyError::Body)?;
 
-	Ok(upstream)
+		if let Some(obj) = resp_json.as_object_mut() {
+			obj.retain(|_, v| !v.is_null());
+		}
+
+		::http::Response::builder()
+			.status(status)
+			.header("content-type", "application/json")
+			.header("access-control-allow-origin", "*")
+			.header("access-control-allow-methods", "POST, OPTIONS")
+			.header("access-control-allow-headers", "content-type")
+			.body(axum::body::Body::from(Bytes::from(
+				serde_json::to_vec(&resp_json).unwrap_or_default(),
+			)))?
+	} else {
+		let mut resp = upstream;
+		let headers = resp.headers_mut();
+		headers.insert("access-control-allow-origin", "*".parse().unwrap());
+		headers.insert("access-control-allow-methods", "POST, OPTIONS".parse().unwrap());
+		headers.insert("access-control-allow-headers", "content-type".parse().unwrap());
+		resp
+	};
+
+	Ok(response)
 }
