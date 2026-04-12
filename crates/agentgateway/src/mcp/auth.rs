@@ -301,10 +301,22 @@ pub(super) async fn client_registration(
 		_ => format!("{issuer}/clients-registrations/openid-connect"),
 	};
 	let body = std::mem::take(req.body_mut());
-	let ureq = ::http::Request::builder()
-		.uri(dcr_uri)
+	let mut builder = ::http::Request::builder()
+		.uri(&dcr_uri)
 		.method(Method::POST)
-		.body(body)?;
+		.header("Content-Type", "application/json");
+
+	// Okta DCR requires an API token with okta.clients.register scope.
+	// Injected via OKTA_DCR_TOKEN env var at runtime.
+	if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
+		if let Ok(token) = std::env::var("OKTA_DCR_TOKEN") {
+			builder = builder.header("Authorization", format!("SSWS {token}"));
+		} else {
+			warn!("OKTA_DCR_TOKEN not set; Okta DCR will fail with 403");
+		}
+	}
+
+	let ureq = builder.body(body)?;
 
 	let mut upstream = client.simple_call(ureq).await?;
 
