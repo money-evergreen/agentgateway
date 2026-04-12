@@ -307,13 +307,14 @@ pub(super) async fn client_registration(
 		.header("Content-Type", "application/json");
 
 	// Okta DCR requires an API token with okta.clients.register scope.
-	// Injected via OKTA_DCR_TOKEN env var at runtime.
+	// Injected via OKTA_DCR_TOKEN env var at runtime. Fails fast if missing.
 	if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
-		if let Ok(token) = std::env::var("OKTA_DCR_TOKEN") {
-			builder = builder.header("Authorization", format!("SSWS {token}"));
-		} else {
-			warn!("OKTA_DCR_TOKEN not set; Okta DCR will fail with 403");
-		}
+		let token = std::env::var("OKTA_DCR_TOKEN").map_err(|_| {
+			ProxyError::ProcessingString(
+				"OKTA_DCR_TOKEN environment variable is required for Okta DCR but not set".to_string(),
+			)
+		})?;
+		builder = builder.header("Authorization", format!("SSWS {token}"));
 	}
 
 	let ureq = builder.body(body)?;
