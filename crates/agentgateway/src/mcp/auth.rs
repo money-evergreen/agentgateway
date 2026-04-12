@@ -131,15 +131,16 @@ pub(super) async fn protected_resource_metadata(
 ) -> Response {
 	let new_uri = strip_oauth_protected_resource_prefix(req);
 
-	// When behind a TLS-terminating proxy, the request URL has http:// but the
-	// external URL is https://. Use the configured resource URL for the
-	// authorization_servers field since it has the correct external scheme.
+	// authorization_servers must be the gateway origin (scheme + host + port).
+	// Clients fetch /.well-known/oauth-authorization-server from this base.
+	// Behind TLS-terminating proxies, use the resource URL's scheme.
 	let issuer = if auth.provider.is_some() {
 		auth.resource_metadata
 			.extra
 			.get("resource")
 			.and_then(|v| v.as_str())
-			.map(|r| r.to_string())
+			.and_then(|r| url::Url::parse(r).ok())
+			.map(|u| u.origin().ascii_serialization())
 			.unwrap_or_else(|| strip_oauth_protected_resource_prefix(req))
 	} else {
 		auth.issuer.clone()
