@@ -52,6 +52,12 @@ jobs:
             SOURCE_PR=""
           fi
 
+          if [[ -z "${SOURCE_PR}" ]]; then
+            SOURCE_PR="0"
+          fi
+
+          VALIDATION_REQUEST_ID="${GITHUB_REPOSITORY}:${SOURCE_PR}:${AGENTGATEWAY_REF}"
+
           payload="$(
             jq -n \
               --arg ref "${AGENTGATEWAY_REF}" \
@@ -60,6 +66,7 @@ jobs:
               --arg base_url "${GATEWAY_BASE_URL}" \
               --arg source_repo "${GITHUB_REPOSITORY}" \
               --arg source_pr "${SOURCE_PR}" \
+              --arg request_id "${VALIDATION_REQUEST_ID}" \
               '{
                 event_type: "agentgateway-ref-validation",
                 client_payload: ({
@@ -67,7 +74,8 @@ jobs:
                   agentgateway_repo: $repo,
                   fly_app: $fly_app,
                   gateway_base_url: $base_url,
-                  source_repo: $source_repo
+                  source_repo: $source_repo,
+                  validation_request_id: $request_id
                 } + (if $source_pr != "" then {source_pr: ($source_pr | tonumber)} else {} end))
               }'
           )"

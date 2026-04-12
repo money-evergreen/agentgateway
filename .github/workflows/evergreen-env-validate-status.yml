@@ -132,6 +132,11 @@ jobs:
             const expectedSha = target.sha || pr.head.sha;
             const expectedShaLower = expectedSha.toLowerCase();
             const expectedShortShaLower = shortSha(expectedSha).toLowerCase();
+            const expectedSourceRepo = `${sourceOwner}/${sourceRepo}`;
+            const expectedSourcePr = String(target.prNumber);
+            const expectedRequestId = `${expectedSourceRepo}:${expectedSourcePr}:${expectedSha}`;
+            const expectedRequestIdLower = expectedRequestId.toLowerCase();
+            const expectedPrTokenLower = `${expectedSourceRepo}#${expectedSourcePr}`.toLowerCase();
 
             let conclusion = null;
             let runUrl = null;
@@ -167,7 +172,8 @@ jobs:
                 const matchingRun = runs.workflow_runs.find((run) => {
                   const searchText = `${run.display_title || ''} ${run.name || ''}`.toLowerCase();
                   return (
-                    run.head_sha === expectedSha ||
+                    searchText.includes(expectedRequestIdLower) ||
+                    searchText.includes(expectedPrTokenLower) ||
                     searchText.includes(expectedShaLower) ||
                     (expectedShortShaLower && searchText.includes(expectedShortShaLower))
                   );
@@ -201,6 +207,7 @@ jobs:
             const commentBody = `${marker}
             ## Evergreen Environment Validation
             - SHA validated: \`${expectedSha}\`
+            - Correlation key: \`${expectedRequestId}\`
             - Status: ${statusEmoji} **${conclusion}**
             - Remote run: ${runLink}
             ${noteLine}
