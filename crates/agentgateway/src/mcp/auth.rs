@@ -131,13 +131,17 @@ pub(super) async fn protected_resource_metadata(
 ) -> Response {
 	let new_uri = strip_oauth_protected_resource_prefix(req);
 
-	// Determine the issuer to use - either use the same request URL and path that it was initially with,
-	// or else keep the auth.issuer
+	// When behind a TLS-terminating proxy, the request URL has http:// but the
+	// external URL is https://. Use the configured resource URL for the
+	// authorization_servers field since it has the correct external scheme.
 	let issuer = if auth.provider.is_some() {
-		// When a provider is configured, use the same request URL with the well-known prefix stripped
-		strip_oauth_protected_resource_prefix(req)
+		auth.resource_metadata
+			.extra
+			.get("resource")
+			.and_then(|v| v.as_str())
+			.map(|r| r.to_string())
+			.unwrap_or_else(|| strip_oauth_protected_resource_prefix(req))
 	} else {
-		// No provider configured, use the original issuer
 		auth.issuer.clone()
 	};
 
