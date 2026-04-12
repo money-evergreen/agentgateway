@@ -71,6 +71,8 @@ jobs:
                   return '⚠️';
                 case 'skipped':
                   return '⏭️';
+                case 'error':
+                  return '⚠️';
                 default:
                   return '❓';
               }
@@ -131,55 +133,62 @@ jobs:
             const expectedShaLower = expectedSha.toLowerCase();
             const expectedShortShaLower = shortSha(expectedSha).toLowerCase();
 
-            const { data: workflows } = await github.rest.actions.listRepoWorkflows({
-              owner: targetOwner,
-              repo: targetRepo,
-              per_page: 100,
-            });
-
-            const targetWorkflow = workflows.workflows.find(
-              (workflow) => workflow.name === targetWorkflowName
-            );
-
-            if (!targetWorkflow) {
-              core.setFailed(
-                `Could not find workflow "${targetWorkflowName}" in ${targetOwner}/${targetRepo}.`
-              );
-              return;
-            }
-
             let conclusion = null;
             let runUrl = null;
             let remoteRunId = null;
+            let runError = null;
 
-            while (Date.now() - startedAt < timeoutMs) {
-              const { data: runs } = await github.rest.actions.listWorkflowRuns({
+            try {
+              const { data: workflows } = await github.rest.actions.listRepoWorkflows({
                 owner: targetOwner,
                 repo: targetRepo,
-                workflow_id: targetWorkflow.id,
-                event: 'repository_dispatch',
                 per_page: 100,
               });
 
-              const matchingRun = runs.workflow_runs.find((run) => {
-                const searchText = `${run.display_title || ''} ${run.name || ''}`.toLowerCase();
-                return (
-                  run.head_sha === expectedSha ||
-                  searchText.includes(expectedShaLower) ||
-                  (expectedShortShaLower && searchText.includes(expectedShortShaLower))
-                );
-              });
+              const targetWorkflow = workflows.workflows.find(
+                (workflow) => workflow.name === targetWorkflowName
+              );
 
-              if (matchingRun) {
-                runUrl = matchingRun.html_url;
-                remoteRunId = matchingRun.id;
-                if (matchingRun.status === 'completed') {
-                  conclusion = matchingRun.conclusion || 'unknown';
-                  break;
-                }
+              if (!targetWorkflow) {
+                throw new Error(
+                  `Could not find workflow "${targetWorkflowName}" in ${targetOwner}/${targetRepo}.`
+                );
               }
 
-              await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+              while (Date.now() - startedAt < timeoutMs) {
+                const { data: runs } = await github.rest.actions.listWorkflowRuns({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  workflow_id: targetWorkflow.id,
+                  event: 'repository_dispatch',
+                  per_page: 100,
+                });
+
+                const matchingRun = runs.workflow_runs.find((run) => {
+                  const searchText = `${run.display_title || ''} ${run.name || ''}`.toLowerCase();
+                  return (
+                    run.head_sha === expectedSha ||
+                    searchText.includes(expectedShaLower) ||
+                    (expectedShortShaLower && searchText.includes(expectedShortShaLower))
+                  );
+                });
+
+                if (matchingRun) {
+                  runUrl = matchingRun.html_url;
+                  remoteRunId = matchingRun.id;
+                  if (matchingRun.status === 'completed') {
+                    conclusion = matchingRun.conclusion || 'unknown';
+                    break;
+                  }
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+              }
+            } catch (error) {
+              const statusText = error?.status ? `${error.status}` : 'unknown';
+              const messageText = error?.message ? String(error.message) : String(error);
+              runError = `${statusText}: ${messageText}`;
+              conclusion = 'error';
             }
 
             if (!conclusion) {
@@ -188,11 +197,13 @@ jobs:
 
             const statusEmoji = emojiForConclusion(conclusion);
             const runLink = runUrl ? `[View run](${runUrl})` : 'Run not found';
+            const noteLine = runError ? `- Notes: \`${runError}\`\n` : '';
             const commentBody = `${marker}
             ## Evergreen Environment Validation
             - SHA validated: \`${expectedSha}\`
             - Status: ${statusEmoji} **${conclusion}**
             - Remote run: ${runLink}
+            ${noteLine}
             - Updated: ${new Date().toISOString()}`.replace(/^            /gm, '');
 
             const { data: comments } = await github.rest.issues.listComments({
@@ -219,7 +230,9 @@ jobs:
               });
             }
 
-            if (conclusion !== 'success') {
+            if (runError) {
+              core.setFailed(`Remote validation check failed before conclusion: ${runError}`);
+            } else if (conclusion !== 'success') {
               const suffix = remoteRunId ? ` (run id: ${remoteRunId})` : '';
               core.setFailed(`Remote Evergreen validation concluded with "${conclusion}"${suffix}.`);
             }
