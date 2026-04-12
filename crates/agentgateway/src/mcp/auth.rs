@@ -259,18 +259,27 @@ pub(super) async fn authorization_server_metadata(
 			*re = format!("{current_uri}/client-registration");
 		},
 		Some(McpIDP::Okta { .. }) => {
-			// Okta custom authorization servers embed the audience in the server config,
-			// so no authorization_endpoint patching is needed (unlike Auth0).
 			// Proxy DCR through the gateway for CORS support.
-			let current_uri = req
+			// Use the resource URL's scheme for the registration_endpoint since
+			// the internal request URL may be http:// behind a TLS proxy.
+			let mut reg_uri = req
 				.extensions()
 				.get::<filters::OriginalUrl>()
-				.map(|u| u.0.clone())
-				.unwrap_or_else(|| req.uri().clone());
+				.map(|u| u.0.to_string())
+				.unwrap_or_else(|| req.uri().to_string());
+			let resource_scheme = auth.resource_metadata
+				.extra
+				.get("resource")
+				.and_then(|v| v.as_str())
+				.and_then(|r| r.split("://").next())
+				.unwrap_or("http");
+			if resource_scheme == "https" && reg_uri.starts_with("http://") {
+				reg_uri = reg_uri.replacen("http://", "https://", 1);
+			}
 			if let Some(serde_json::Value::String(re)) =
 				json::traverse_mut(&mut resp, &["registration_endpoint"])
 			{
-				*re = format!("{current_uri}/client-registration");
+				*re = format!("{reg_uri}/client-registration");
 			}
 		},
 		_ => {},
