@@ -4,6 +4,10 @@ use axum_core::response::IntoResponse;
 use bytes::Bytes;
 use http::Method;
 use http::uri::PathAndQuery;
+use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::http::jwt::Claims;
@@ -14,6 +18,208 @@ use crate::json::from_body_with_limit;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{McpAuthentication, McpIDP};
+
+static LOCAL_CLIENT_REGISTRY: Lazy<RwLock<LocalClientRegistry>> =
+	Lazy::new(|| RwLock::new(LocalClientRegistry::default()));
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalClientRegistrationRequest {
+	redirect_uris: Vec<String>,
+	#[serde(default)]
+	client_name: Option<String>,
+	#[serde(default)]
+	token_endpoint_auth_method: Option<String>,
+	#[serde(default)]
+	grant_types: Option<Vec<String>>,
+	#[serde(default)]
+	response_types: Option<Vec<String>>,
+	#[serde(default)]
+	scope: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct LocalClientRegistrationRecord {
+	client_id: String,
+	client_secret: String,
+	active: bool,
+	redirect_uris: Vec<String>,
+	client_name: Option<String>,
+	token_endpoint_auth_method: String,
+	grant_types: Vec<String>,
+	response_types: Vec<String>,
+	scope: Option<String>,
+}
+
+#[derive(Default)]
+struct LocalClientRegistry {
+	by_id: HashMap<String, LocalClientRegistrationRecord>,
+}
+
+impl LocalClientRegistrationRequest {
+	fn validate_and_normalize(mut self) -> Result<Self, String> {
+		if self.redirect_uris.is_empty() {
+			return Err("redirect_uris must contain at least one URI".into());
+		}
+		let mut normalized_redirects = BTreeSet::new();
+		for uri in self.redirect_uris {
+			let parsed = url::Url::parse(&uri)
+				.map_err(|e| format!("redirect_uris must be absolute URLs: {e}"))?;
+			if !matches!(parsed.scheme(), "http" | "https") {
+				return Err("redirect_uris must use http or https".into());
+			}
+			normalized_redirects.insert(parsed.to_string());
+		}
+		self.redirect_uris = normalized_redirects.into_iter().collect();
+
+		let auth_method = self
+			.token_endpoint_auth_method
+			.clone()
+			.unwrap_or_else(|| "client_secret_basic".into());
+		if !matches!(
+			auth_method.as_str(),
+			"client_secret_basic" | "client_secret_post" | "none"
+		) {
+			return Err(
+				"token_endpoint_auth_method must be one of: client_secret_basic, client_secret_post, none"
+					.into(),
+			);
+		}
+		self.token_endpoint_auth_method = Some(auth_method);
+
+		let mut grant_types = self
+			.grant_types
+			.take()
+			.unwrap_or_else(|| vec!["authorization_code".into()]);
+		grant_types.sort();
+		grant_types.dedup();
+		if grant_types.is_empty()
+			|| !grant_types
+				.iter()
+				.all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token"))
+		{
+			return Err(
+				"grant_types must include supported values only: authorization_code, refresh_token"
+					.into(),
+			);
+		}
+		self.grant_types = Some(grant_types);
+
+		let mut response_types = self
+			.response_types
+			.take()
+			.unwrap_or_else(|| vec!["code".into()]);
+		response_types.sort();
+		response_types.dedup();
+		if response_types != vec!["code".to_string()] {
+			return Err("response_types must be exactly ['code']".into());
+		}
+		self.response_types = Some(response_types);
+
+		if let Some(scope) = self.scope.as_mut() {
+			*scope = scope.trim().to_string();
+			if scope.is_empty() {
+				self.scope = None;
+			}
+		}
+
+		Ok(self)
+	}
+
+	fn deterministic_client_id(&self, issuer: &str) -> Result<String, String> {
+		let canonical = serde_json::to_vec(&(issuer, self))
+			.map_err(|e| format!("failed to canonicalize registration request: {e}"))?;
+		let mut hasher = Sha256::new();
+		hasher.update(canonical);
+		let digest = hasher.finalize();
+		let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+		Ok(format!("agw_{}", &digest_hex[..24]))
+	}
+}
+
+impl LocalClientRegistry {
+	fn register(
+		&mut self,
+		issuer: &str,
+		request: LocalClientRegistrationRequest,
+	) -> Result<(LocalClientRegistrationRecord, bool), String> {
+		let request = request.validate_and_normalize()?;
+		let client_id = request.deterministic_client_id(issuer)?;
+		if let Some(existing) = self.by_id.get(&client_id) {
+			if !existing.active {
+				return Err("client registration exists but is deactivated".into());
+			}
+			return Ok((existing.clone(), false));
+		}
+
+		let mut hasher = Sha256::new();
+		hasher.update(client_id.as_bytes());
+		hasher.update(b":secret");
+		let digest = hasher.finalize();
+		let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+		let client_secret = format!("agw_secret_{}", &digest_hex[..32]);
+
+		let record = LocalClientRegistrationRecord {
+			client_id: client_id.clone(),
+			client_secret,
+			active: true,
+			redirect_uris: request.redirect_uris,
+			client_name: request.client_name,
+			token_endpoint_auth_method: request
+				.token_endpoint_auth_method
+				.unwrap_or_else(|| "client_secret_basic".into()),
+			grant_types: request
+				.grant_types
+				.unwrap_or_else(|| vec!["authorization_code".into()]),
+			response_types: request.response_types.unwrap_or_else(|| vec!["code".into()]),
+			scope: request.scope,
+		};
+		self.by_id.insert(client_id, record.clone());
+		Ok((record, true))
+	}
+
+	fn get(&self, client_id: &str) -> Option<LocalClientRegistrationRecord> {
+		self.by_id.get(client_id).cloned()
+	}
+
+	fn update(
+		&mut self,
+		client_id: &str,
+		request: LocalClientRegistrationRequest,
+	) -> Result<LocalClientRegistrationRecord, String> {
+		let normalized = request.validate_and_normalize()?;
+		let existing = self
+			.by_id
+			.get_mut(client_id)
+			.ok_or_else(|| "unknown client_id".to_string())?;
+		if !existing.active {
+			return Err("client registration is deactivated".into());
+		}
+		existing.redirect_uris = normalized.redirect_uris;
+		existing.client_name = normalized.client_name;
+		existing.token_endpoint_auth_method = normalized
+			.token_endpoint_auth_method
+			.unwrap_or_else(|| "client_secret_basic".into());
+		existing.grant_types = normalized
+			.grant_types
+			.unwrap_or_else(|| vec!["authorization_code".into()]);
+		existing.response_types = normalized.response_types.unwrap_or_else(|| vec!["code".into()]);
+		existing.scope = normalized.scope;
+		Ok(existing.clone())
+	}
+
+	fn deactivate(&mut self, client_id: &str) -> Result<LocalClientRegistrationRecord, String> {
+		let existing = self
+			.by_id
+			.get_mut(client_id)
+			.ok_or_else(|| "unknown client_id".to_string())?;
+		if !existing.active {
+			return Err("client registration is already deactivated".into());
+		}
+		existing.active = false;
+		Ok(existing.clone())
+	}
+}
 
 pub(crate) fn is_well_known_endpoint(path: &str) -> bool {
 	path.starts_with("/.well-known/oauth-protected-resource")
@@ -67,9 +273,10 @@ pub(crate) async fn handle_mcp_request(
 	auth: &McpAuthentication,
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
+	let _ = client;
 	match req.uri().path() {
 		// TODO: indicate this is a DirectResponse
-		path if path.ends_with("client-registration") => Ok(Some(
+		path if path.contains("/client-registration") => Ok(Some(
 			client_registration(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -272,27 +479,194 @@ pub(super) async fn client_registration(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	// Normalize issuer URL by removing trailing slashes to avoid double-slash in path
-	let issuer = auth.issuer.trim_end_matches('/');
-	let body = std::mem::take(req.body_mut());
-	let ureq = ::http::Request::builder()
-		.uri(format!("{issuer}/clients-registrations/openid-connect"))
-		.method(Method::POST)
-		.body(body)?;
+	let _ = client;
+	let path = req.uri().path().to_string();
+	let Some((_, suffix)) = path.split_once("/client-registration") else {
+		return build_json_response(
+			StatusCode::NOT_FOUND,
+			serde_json::json!({ "error": "registration path not found" }),
+		);
+	};
+	let client_id = suffix.trim_start_matches('/').trim();
+	let body: serde_json::Value = from_body_with_limit(
+		std::mem::take(req.body_mut()),
+		crate::defaults::max_buffer_size(),
+	)
+	.await
+	.map_err(ProxyError::Body)?;
+	let method = req.method().clone();
 
-	let mut upstream = client.simple_call(ureq).await?;
+	match method {
+		Method::POST => {
+			let request: LocalClientRegistrationRequest = serde_json::from_value(body).map_err(|e| {
+				ProxyError::ProcessingString(format!(
+					"invalid client registration metadata payload: {e}"
+				))
+			})?;
+			let (record, created) = LOCAL_CLIENT_REGISTRY
+				.write()
+				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+				.register(&auth.issuer, request)
+				.map_err(ProxyError::ProcessingString)?;
+			let status = if created {
+				StatusCode::CREATED
+			} else {
+				StatusCode::OK
+			};
+			build_json_response(status, serde_json::to_value(record).unwrap_or_default())
+		},
+		Method::GET => {
+			if client_id.is_empty() {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({ "error": "client_id path segment is required for GET" }),
+				);
+			}
+			let registry = LOCAL_CLIENT_REGISTRY
+				.read()
+				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?;
+			match registry.get(client_id) {
+				Some(record) if record.active => {
+					build_json_response(StatusCode::OK, serde_json::to_value(record).unwrap_or_default())
+				},
+				Some(_) => build_json_response(
+					StatusCode::GONE,
+					serde_json::json!({ "error": "client registration is deactivated" }),
+				),
+				None => build_json_response(
+					StatusCode::NOT_FOUND,
+					serde_json::json!({ "error": "client registration not found" }),
+				),
+			}
+		},
+		Method::PUT | Method::PATCH => {
+			if client_id.is_empty() {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({ "error": "client_id path segment is required for update" }),
+				);
+			}
+			let request: LocalClientRegistrationRequest = serde_json::from_value(body).map_err(|e| {
+				ProxyError::ProcessingString(format!(
+					"invalid client registration metadata payload: {e}"
+				))
+			})?;
+			let updated = LOCAL_CLIENT_REGISTRY
+				.write()
+				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+				.update(client_id, request)
+				.map_err(ProxyError::ProcessingString)?;
+			build_json_response(StatusCode::OK, serde_json::to_value(updated).unwrap_or_default())
+		},
+		Method::DELETE => {
+			if client_id.is_empty() {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({ "error": "client_id path segment is required for delete" }),
+				);
+			}
+			let deactivated = LOCAL_CLIENT_REGISTRY
+				.write()
+				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+				.deactivate(client_id)
+				.map_err(ProxyError::ProcessingString)?;
+			build_json_response(
+				StatusCode::OK,
+				serde_json::json!({
+					"client_id": deactivated.client_id,
+					"active": deactivated.active
+				}),
+			)
+		},
+		_ => build_json_response(
+			StatusCode::METHOD_NOT_ALLOWED,
+			serde_json::json!({ "error": "method not allowed for client-registration endpoint" }),
+		),
+	}
+}
 
-	// Add CORS headers to the response
-	let headers = upstream.headers_mut();
-	headers.insert("access-control-allow-origin", "*".parse().unwrap());
-	headers.insert(
-		"access-control-allow-methods",
-		"POST, OPTIONS".parse().unwrap(),
-	);
-	headers.insert(
-		"access-control-allow-headers",
-		"content-type".parse().unwrap(),
-	);
+fn build_json_response(status: StatusCode, body: serde_json::Value) -> Result<Response, ProxyError> {
+	::http::Response::builder()
+		.status(status)
+		.header("content-type", "application/json")
+		.header("access-control-allow-origin", "*")
+		.header("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		.header("access-control-allow-headers", "content-type")
+		.body(axum::body::Body::from(Bytes::from(
+			serde_json::to_vec(&body).map_err(|e| ProxyError::ProcessingString(e.to_string()))?,
+		)))
+		.map_err(ProxyError::Http)
+}
 
-	Ok(upstream)
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sample_request() -> LocalClientRegistrationRequest {
+		LocalClientRegistrationRequest {
+			redirect_uris: vec!["https://app.example/callback".into()],
+			client_name: Some("my app".into()),
+			token_endpoint_auth_method: Some("client_secret_basic".into()),
+			grant_types: Some(vec!["authorization_code".into()]),
+			response_types: Some(vec!["code".into()]),
+			scope: Some("openid profile".into()),
+		}
+	}
+
+	#[test]
+	fn deterministic_registration_is_idempotent() {
+		let mut registry = LocalClientRegistry::default();
+		let issuer = "https://issuer.example";
+		let (first, created_first) = registry.register(issuer, sample_request()).expect("register");
+		let (second, created_second) = registry.register(issuer, sample_request()).expect("register");
+		assert!(created_first);
+		assert!(!created_second);
+		assert_eq!(first.client_id, second.client_id);
+	}
+
+	#[test]
+	fn update_and_deactivate_lifecycle_is_enforced() {
+		let mut registry = LocalClientRegistry::default();
+		let issuer = "https://issuer.example";
+		let (record, _) = registry.register(issuer, sample_request()).expect("register");
+
+		let updated = registry
+			.update(
+				&record.client_id,
+				LocalClientRegistrationRequest {
+					redirect_uris: vec!["https://updated.example/callback".into()],
+					client_name: Some("updated".into()),
+					token_endpoint_auth_method: Some("client_secret_post".into()),
+					grant_types: Some(vec!["authorization_code".into(), "refresh_token".into()]),
+					response_types: Some(vec!["code".into()]),
+					scope: Some("openid email".into()),
+				},
+			)
+			.expect("update");
+		assert_eq!(updated.client_name.as_deref(), Some("updated"));
+		assert_eq!(updated.token_endpoint_auth_method, "client_secret_post");
+
+		let deactivated = registry.deactivate(&record.client_id).expect("deactivate");
+		assert!(!deactivated.active);
+		assert!(registry.update(&record.client_id, sample_request()).is_err());
+	}
+
+	#[test]
+	fn malformed_or_unsupported_metadata_is_rejected() {
+		let mut registry = LocalClientRegistry::default();
+		let err = registry
+			.register(
+				"https://issuer.example",
+				LocalClientRegistrationRequest {
+					redirect_uris: vec!["not-a-uri".into()],
+					client_name: None,
+					token_endpoint_auth_method: Some("private_key_jwt".into()),
+					grant_types: Some(vec!["client_credentials".into()]),
+					response_types: Some(vec!["token".into()]),
+					scope: None,
+				},
+			)
+			.expect_err("invalid metadata should fail");
+		assert!(err.contains("redirect_uris") || err.contains("token_endpoint_auth_method"));
+	}
 }
