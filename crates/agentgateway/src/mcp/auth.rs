@@ -300,21 +300,27 @@ pub(super) async fn client_registration(
 		},
 		_ => format!("{issuer}/clients-registrations/openid-connect"),
 	};
+	let method = req.method().clone();
 	let body = std::mem::take(req.body_mut());
 	let mut builder = ::http::Request::builder()
 		.uri(&dcr_uri)
-		.method(Method::POST)
+		.method(&method)
 		.header("Content-Type", "application/json");
 
 	// Okta DCR requires an API token with okta.clients.register scope
 	// and the request body must include application_type (not in RFC 7591).
-	let body = if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
+	// Okta requires SSWS token on all DCR requests (GET and POST).
+	if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
 		let token = std::env::var("OKTA_DCR_TOKEN").map_err(|_| {
 			ProxyError::ProcessingString(
 				"OKTA_DCR_TOKEN environment variable is required for Okta DCR but not set".to_string(),
 			)
 		})?;
 		builder = builder.header("Authorization", format!("SSWS {token}"));
+	}
+
+	// Only transform the body on POST (actual registration). GET is passthrough.
+	let body = if matches!(&auth.provider, Some(McpIDP::Okta { .. })) && method == Method::POST {
 
 		// Transform RFC 7591 body to Okta format: add application_type if missing
 		let mut json_body: serde_json::Value = from_body_with_limit(body, 64 * 1024)
