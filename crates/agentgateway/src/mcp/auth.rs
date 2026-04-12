@@ -306,16 +306,49 @@ pub(super) async fn client_registration(
 		.method(Method::POST)
 		.header("Content-Type", "application/json");
 
-	// Okta DCR requires an API token with okta.clients.register scope.
-	// Injected via OKTA_DCR_TOKEN env var at runtime. Fails fast if missing.
-	if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
+	// Okta DCR requires an API token with okta.clients.register scope
+	// and the request body must include application_type (not in RFC 7591).
+	let body = if matches!(&auth.provider, Some(McpIDP::Okta { .. })) {
 		let token = std::env::var("OKTA_DCR_TOKEN").map_err(|_| {
 			ProxyError::ProcessingString(
 				"OKTA_DCR_TOKEN environment variable is required for Okta DCR but not set".to_string(),
 			)
 		})?;
 		builder = builder.header("Authorization", format!("SSWS {token}"));
-	}
+
+		// Transform RFC 7591 body to Okta format: add application_type if missing
+		let mut json_body: serde_json::Value = from_body_with_limit(body, 64 * 1024)
+			.await
+			.map_err(ProxyError::Body)?;
+
+		if let Some(obj) = json_body.as_object_mut() {
+			// Okta requires application_type; infer from token_endpoint_auth_method
+			if !obj.contains_key("application_type") {
+				let auth_method = obj
+					.get("token_endpoint_auth_method")
+					.and_then(|v| v.as_str())
+					.unwrap_or("client_secret_basic");
+				let app_type = if auth_method == "none" { "native" } else { "web" };
+				obj.insert(
+					"application_type".to_string(),
+					serde_json::Value::String(app_type.to_string()),
+				);
+			}
+			// Ensure client_name exists (Okta requires it)
+			if !obj.contains_key("client_name") {
+				obj.insert(
+					"client_name".to_string(),
+					serde_json::Value::String("MCP Client".to_string()),
+				);
+			}
+		}
+
+		Body::from(Bytes::from(serde_json::to_vec(&json_body).map_err(|e| {
+			ProxyError::ProcessingString(format!("failed to serialize DCR body: {e}"))
+		})?))
+	} else {
+		body
+	};
 
 	let ureq = builder.body(body)?;
 
