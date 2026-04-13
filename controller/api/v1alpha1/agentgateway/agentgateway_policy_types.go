@@ -708,7 +708,7 @@ type JWTMCPConfig struct {
 	ResourceMetadata map[string]apiextensionsv1.JSON `json:"resourceMetadata,omitempty"`
 
 	// `provider` specifies the identity provider to use for MCP authentication flows.
-	// +kubebuilder:validation:Enum=Auth0;Keycloak
+	// +kubebuilder:validation:Enum=Auth0;Keycloak;Okta
 	// +optional
 	Provider *McpIDP `json:"provider,omitempty"`
 }
@@ -1120,7 +1120,7 @@ type MCPAuthentication struct {
 	ResourceMetadata map[string]apiextensionsv1.JSON `json:"resourceMetadata"`
 
 	// `provider` specifies the identity provider to use for authentication.
-	// +kubebuilder:validation:Enum=Auth0;Keycloak
+	// +kubebuilder:validation:Enum=Auth0;Keycloak;Okta
 	// +optional
 	McpIDP *McpIDP `json:"provider,omitempty"`
 
@@ -1154,6 +1154,7 @@ type McpIDP string
 const (
 	Auth0    McpIDP = "Auth0"
 	Keycloak McpIDP = "Keycloak"
+	Okta     McpIDP = "Okta"
 )
 
 type BackendTunnel struct {
