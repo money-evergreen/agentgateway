@@ -53,7 +53,7 @@ jobs:
             const targetOwner = 'money-evergreen';
             const targetRepo = 'evergreen-mcp-gateway';
             const targetWorkflowName = 'Validate Agentgateway Ref In Evergreen Env';
-            const timeoutMs = 20 * 60 * 1000;
+            const timeoutMs = 30 * 60 * 1000;
             const pollIntervalMs = 25000;
             const startedAt = Date.now();
 
@@ -80,6 +80,55 @@ jobs:
 
             function shortSha(sha) {
               return (sha || '').slice(0, 7);
+            }
+
+            function elapsedStr() {
+              const secs = Math.round((Date.now() - startedAt) / 1000);
+              const m = Math.floor(secs / 60);
+              const s = secs % 60;
+              return `${m}m${s}s`;
+            }
+
+            async function fetchRemoteRunDiagnostics(runId) {
+              if (!runId) return null;
+              try {
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  run_id: runId,
+                });
+                const diag = {
+                  status: run.status,
+                  conclusion: run.conclusion,
+                  currentJob: null,
+                  currentStep: null,
+                };
+                try {
+                  const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+                    owner: targetOwner,
+                    repo: targetRepo,
+                    run_id: runId,
+                    per_page: 50,
+                  });
+                  const activeJob = jobs.jobs.find(
+                    (j) => j.status === 'in_progress' || j.status === 'queued'
+                  ) || jobs.jobs[jobs.jobs.length - 1];
+                  if (activeJob) {
+                    diag.currentJob = activeJob.name;
+                    const activeStep = activeJob.steps?.find(
+                      (s) => s.status === 'in_progress' || s.status === 'queued'
+                    );
+                    if (activeStep) {
+                      diag.currentStep = activeStep.name;
+                    }
+                  }
+                } catch (_) {
+                  // jobs API may fail; diagnostics are best-effort
+                }
+                return diag;
+              } catch (_) {
+                return null;
+              }
             }
 
             async function getPrAndSha() {
@@ -142,6 +191,7 @@ jobs:
             let runUrl = null;
             let remoteRunId = null;
             let runError = null;
+            let lastRemoteStatus = null;
 
             try {
               const { data: workflows } = await github.rest.actions.listRepoWorkflows({
@@ -182,6 +232,7 @@ jobs:
                 if (matchingRun) {
                   runUrl = matchingRun.html_url;
                   remoteRunId = matchingRun.id;
+                  lastRemoteStatus = matchingRun.status;
                   if (matchingRun.status === 'completed') {
                     conclusion = matchingRun.conclusion || 'unknown';
                     break;
@@ -201,16 +252,42 @@ jobs:
               conclusion = 'timed_out';
             }
 
+            // On non-success, fetch diagnostics from the remote run
+            let diagLines = '';
+            if (conclusion !== 'success' && remoteRunId) {
+              const diag = await fetchRemoteRunDiagnostics(remoteRunId);
+              if (diag) {
+                const parts = [];
+                if (diag.status) parts.push(`Remote run status: \`${diag.status}\``);
+                if (diag.conclusion) parts.push(`Remote run conclusion: \`${diag.conclusion}\``);
+                if (diag.currentJob) parts.push(`Current/last job: \`${diag.currentJob}\``);
+                if (diag.currentStep) parts.push(`Current/last step: \`${diag.currentStep}\``);
+                if (parts.length > 0) {
+                  diagLines = parts.map(p => `- ${p}`).join('\n') + '\n';
+                }
+              }
+            }
+
             const statusEmoji = emojiForConclusion(conclusion);
             const runLink = runUrl ? `[View run](${runUrl})` : 'Run not found';
-            const noteLine = runError ? `- Notes: \`${runError}\`\n` : '';
+            const runIdLine = remoteRunId ? `- Remote run ID: \`${remoteRunId}\`\n` : '';
+            const elapsed = `- Poll duration: ${elapsedStr()}\n`;
+            const noteLine = runError ? `- Error: \`${runError}\`\n` : '';
+            const failReason = conclusion === 'timed_out'
+              ? `- Failure reason: Poll timed out after 30m waiting for remote run to complete\n`
+              : conclusion === 'error'
+                ? `- Failure reason: API error during polling\n`
+                : conclusion !== 'success' && conclusion !== 'unknown'
+                  ? `- Failure reason: Remote run concluded with \`${conclusion}\`\n`
+                  : '';
+
             const commentBody = `${marker}
             ## Evergreen Environment Validation
             - SHA validated: \`${expectedSha}\`
             - Correlation key: \`${expectedRequestId}\`
             - Status: ${statusEmoji} **${conclusion}**
             - Remote run: ${runLink}
-            ${noteLine}
+            ${runIdLine}${elapsed}${diagLines}${noteLine}${failReason}
             - Updated: ${new Date().toISOString()}`.replace(/^            /gm, '');
 
             const { data: comments } = await github.rest.issues.listComments({
