@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::http::jwt::Claims;
 use crate::http::oauth::{authorization_server_metadata_url, openid_configuration_metadata_url};
@@ -548,17 +548,27 @@ pub(super) async fn client_registration(
 					"invalid client registration metadata payload: {e}"
 				))
 			})?;
-			let (record, created) = LOCAL_CLIENT_REGISTRY
-				.write()
-				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-				.register(&auth.issuer, request)
-				.map_err(ProxyError::ProcessingString)?;
-			let status = if created {
-				StatusCode::CREATED
-			} else {
-				StatusCode::OK
-			};
-			build_json_response(status, serde_json::to_value(record).unwrap_or_default())
+		let (record, created) = LOCAL_CLIENT_REGISTRY
+			.write()
+			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+			.register(&auth.issuer, request)
+			.map_err(ProxyError::ProcessingString)?;
+		let status = if created {
+			info!(
+				client_id = %record.client_id,
+				audit_event = "client_registered",
+				"new MCP client registration created"
+			);
+			StatusCode::CREATED
+		} else {
+			debug!(
+				client_id = %record.client_id,
+				audit_event = "client_registration_idempotent",
+				"MCP client registration already exists"
+			);
+			StatusCode::OK
+		};
+		build_json_response(status, serde_json::to_value(record).unwrap_or_default())
 		},
 		Method::GET => {
 			if client_id.is_empty() {
@@ -596,33 +606,46 @@ pub(super) async fn client_registration(
 					"invalid client registration metadata payload: {e}"
 				))
 			})?;
-			let updated = LOCAL_CLIENT_REGISTRY
-				.write()
-				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-				.update(client_id, request)
-				.map_err(ProxyError::ProcessingString)?;
-			build_json_response(StatusCode::OK, serde_json::to_value(updated).unwrap_or_default())
+		let updated = LOCAL_CLIENT_REGISTRY
+			.write()
+			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+			.update(client_id, request)
+			.map_err(ProxyError::ProcessingString)?;
+		info!(
+			client_id = %updated.client_id,
+			audit_event = "client_updated",
+			"MCP client registration updated"
+		);
+		build_json_response(StatusCode::OK, serde_json::to_value(updated).unwrap_or_default())
 		},
 		Method::DELETE => {
-			if client_id.is_empty() {
-				return build_json_response(
-					StatusCode::BAD_REQUEST,
-					serde_json::json!({ "error": "client_id path segment is required for delete" }),
-				);
-			}
-			let deactivated = LOCAL_CLIENT_REGISTRY
-				.write()
-				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-				.deactivate(client_id)
-				.map_err(ProxyError::ProcessingString)?;
-			build_json_response(
-				StatusCode::OK,
-				serde_json::json!({
-					"client_id": deactivated.client_id,
-					"active": deactivated.active
-				}),
-			)
-		},
+		if client_id.is_empty() {
+			return build_json_response(
+				StatusCode::BAD_REQUEST,
+				serde_json::json!({ "error": "client_id path segment is required for delete" }),
+			);
+		}
+		let deactivated = LOCAL_CLIENT_REGISTRY
+			.write()
+			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
+			.deactivate(client_id)
+			.map_err(ProxyError::ProcessingString)?;
+		let revoked = super::oidc_proxy::revoke_client(&deactivated.client_id);
+		info!(
+			client_id = %deactivated.client_id,
+			transactions_revoked = revoked.0,
+			auth_codes_revoked = revoked.1,
+			audit_event = "client_deactivated",
+			"MCP client deactivated; pending auth state purged"
+		);
+		build_json_response(
+			StatusCode::OK,
+			serde_json::json!({
+				"client_id": deactivated.client_id,
+				"active": deactivated.active
+			}),
+		)
+	},
 		_ => build_json_response(
 			StatusCode::METHOD_NOT_ALLOWED,
 			serde_json::json!({ "error": "method not allowed for client-registration endpoint" }),
@@ -694,6 +717,24 @@ mod tests {
 		let deactivated = registry.deactivate(&record.client_id).expect("deactivate");
 		assert!(!deactivated.active);
 		assert!(registry.update(&record.client_id, sample_request()).is_err());
+	}
+
+	#[test]
+	fn deactivated_client_blocks_re_registration_and_update() {
+		let mut registry = LocalClientRegistry::default();
+		let issuer = "https://issuer.example";
+		let (record, _) = registry.register(issuer, sample_request()).expect("register");
+		registry.deactivate(&record.client_id).expect("deactivate");
+
+		let err = registry
+			.register(issuer, sample_request())
+			.expect_err("re-registration after deactivation must fail");
+		assert!(err.contains("deactivated"));
+
+		let err = registry
+			.update(&record.client_id, sample_request())
+			.expect_err("update after deactivation must fail");
+		assert!(err.contains("deactivated"));
 	}
 
 	#[test]
