@@ -1,0 +1,89 @@
+name: Evergreen Environment Validate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  dispatch-validation:
+    name: Dispatch cross-repo validation
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    steps:
+      - name: Mint Orion installation token
+        id: orion_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.ORION_APP_ID }}
+          private-key: ${{ secrets.ORION_APP_PRIVATE_KEY }}
+          owner: money-evergreen
+          repositories: evergreen-mcp-gateway,agentgateway
+
+      - name: Dispatch validation workflow in evergreen-mcp-gateway
+        env:
+          TARGET_OWNER: money-evergreen
+          TARGET_REPO: evergreen-mcp-gateway
+          AGENTGATEWAY_REPO_URL: https://github.com/money-evergreen/agentgateway.git
+          FLY_APP: evergreen-mcp-gateway-dev
+          GATEWAY_BASE_URL: https://evergreen-mcp-gateway-dev.fly.dev
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${{ steps.orion_token.outputs.token }}" ]]; then
+            echo "Failed to mint Orion installation token." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            AGENTGATEWAY_REF="${{ github.event.pull_request.head.sha }}"
+            SOURCE_PR="${{ github.event.pull_request.number }}"
+          else
+            AGENTGATEWAY_REF="${GITHUB_SHA}"
+            SOURCE_PR=""
+          fi
+
+          if [[ -z "${SOURCE_PR}" ]]; then
+            SOURCE_PR="0"
+          fi
+
+          VALIDATION_REQUEST_ID="${GITHUB_REPOSITORY}:${SOURCE_PR}:${AGENTGATEWAY_REF}"
+
+          payload="$(
+            jq -n \
+              --arg ref "${AGENTGATEWAY_REF}" \
+              --arg repo "${AGENTGATEWAY_REPO_URL}" \
+              --arg fly_app "${FLY_APP}" \
+              --arg base_url "${GATEWAY_BASE_URL}" \
+              --arg source_repo "${GITHUB_REPOSITORY}" \
+              --arg source_pr "${SOURCE_PR}" \
+              --arg request_id "${VALIDATION_REQUEST_ID}" \
+              '{
+                event_type: "agentgateway-ref-validation",
+                client_payload: ({
+                  agentgateway_ref: $ref,
+                  agentgateway_repo: $repo,
+                  fly_app: $fly_app,
+                  gateway_base_url: $base_url,
+                  source_repo: $source_repo,
+                  validation_request_id: $request_id
+                } + (if $source_pr != "" then {source_pr: ($source_pr | tonumber)} else {} end))
+              }'
+          )"
+
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ steps.orion_token.outputs.token }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/dispatches" \
+            -d "${payload}"
