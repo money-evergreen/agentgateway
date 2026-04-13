@@ -416,15 +416,13 @@ pub(super) async fn protected_resource_metadata(
 	req: &mut Request,
 	auth: &McpAuthentication,
 ) -> Response {
-	let new_uri = strip_oauth_protected_resource_prefix(req);
+	let new_uri = strip_oauth_protected_resource_prefix_public(req);
 
-	// Determine the issuer to use - either use the same request URL and path that it was initially with,
-	// or else keep the auth.issuer
-	let issuer = if auth.provider.is_some() {
-		// When a provider is configured, use the same request URL with the well-known prefix stripped
-		strip_oauth_protected_resource_prefix(req)
+	let issuer = if auth.oidc_proxy.is_some() {
+		derive_public_base_url_for_as(req)
+	} else if auth.provider.is_some() {
+		strip_oauth_protected_resource_prefix_public(req)
 	} else {
-		// No provider configured, use the original issuer
 		auth.issuer.clone()
 	};
 
@@ -461,23 +459,55 @@ fn get_redirect_url(req: &Request, strip_base: &str) -> String {
 		.unwrap_or(uri.to_string())
 }
 
-fn strip_oauth_protected_resource_prefix(req: &Request) -> String {
+fn strip_oauth_protected_resource_prefix_public(req: &Request) -> String {
+	let full = derive_public_base_url(req);
+	const OAUTH_PREFIX: &str = "/.well-known/oauth-protected-resource";
+
 	let uri = req
 		.extensions()
 		.get::<filters::OriginalUrl>()
 		.map(|u| u.0.clone())
 		.unwrap_or_else(|| req.uri().clone());
-
 	let path = uri.path();
-	const OAUTH_PREFIX: &str = "/.well-known/oauth-protected-resource";
 
-	// Remove the oauth-protected-resource prefix and keep the remaining path
 	if let Some(remaining_path) = path.strip_prefix(OAUTH_PREFIX) {
-		uri.to_string().replace(path, remaining_path)
+		full.replace(path, remaining_path)
 	} else {
-		// If the prefix is not found, return the original URI
-		uri.to_string()
+		full
 	}
+}
+
+/// Derive the AS base URL for the protected-resource authorization_servers field.
+/// Uses the public URL but with the well-known AS path.
+fn derive_public_base_url_for_as(req: &Request) -> String {
+	let uri = req
+		.extensions()
+		.get::<filters::OriginalUrl>()
+		.map(|u| u.0.clone())
+		.unwrap_or_else(|| req.uri().clone());
+	let path = uri.path();
+
+	let scheme = req
+		.headers()
+		.get("x-forwarded-proto")
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https"));
+	let host = req
+		.headers()
+		.get("x-forwarded-host")
+		.and_then(|v| v.to_str().ok())
+		.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
+		.or_else(|| uri.host())
+		.unwrap_or("localhost");
+
+	const PRM_PREFIX: &str = "/.well-known/oauth-protected-resource";
+	let as_path = if let Some(suffix) = path.strip_prefix(PRM_PREFIX) {
+		format!("/.well-known/oauth-authorization-server{suffix}")
+	} else {
+		"/.well-known/oauth-authorization-server".to_string()
+	};
+
+	format!("{scheme}://{host}{as_path}")
 }
 
 pub(super) async fn authorization_server_metadata(
@@ -485,8 +515,52 @@ pub(super) async fn authorization_server_metadata(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	// RFC 8414 URL for standard AS metadata. Keycloak does not implement RFC 8414; it only
-	// exposes OpenID Provider Metadata at {issuer}/.well-known/openid-configuration (OIDC Discovery).
+	let resp = if auth.oidc_proxy.is_some() {
+		build_gateway_as_metadata(req, auth)
+	} else {
+		build_proxied_as_metadata(req, auth, client).await?
+	};
+
+	let response = ::http::Response::builder()
+		.status(StatusCode::OK)
+		.header("content-type", "application/json")
+		.header("access-control-allow-origin", "*")
+		.header("access-control-allow-methods", "GET, OPTIONS")
+		.header("access-control-allow-headers", "content-type")
+		.body(axum::body::Body::from(Bytes::from(
+			serde_json::to_string(&resp).map_err(|e| ProxyError::Body(crate::http::Error::new(e)))?,
+		)))?;
+
+	Ok(response)
+}
+
+/// Build a clean RFC 8414 AS metadata document for the gateway itself.
+/// No upstream IDP fields are merged — the gateway IS the authorization server.
+fn build_gateway_as_metadata(
+	req: &Request,
+	auth: &McpAuthentication,
+) -> serde_json::Value {
+	let base_url = derive_public_base_url(req);
+
+	serde_json::json!({
+		"issuer": base_url,
+		"authorization_endpoint": format!("{base_url}/authorize"),
+		"token_endpoint": format!("{base_url}/token"),
+		"registration_endpoint": format!("{base_url}/client-registration"),
+		"code_challenge_methods_supported": ["S256"],
+		"grant_types_supported": ["authorization_code"],
+		"response_types_supported": ["code"],
+		"token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+		"jwks_uri": format!("{}/.well-known/jwks.json", auth.issuer.trim_end_matches('/')),
+	})
+}
+
+/// Build AS metadata by proxying the upstream IDP's metadata and adapting fields.
+async fn build_proxied_as_metadata(
+	req: &mut Request,
+	auth: &McpAuthentication,
+	client: PolicyClient,
+) -> Result<serde_json::Value, ProxyError> {
 	let metadata_uri = match &auth.provider {
 		Some(McpIDP::Keycloak { .. }) => openid_configuration_metadata_url(&auth.issuer),
 		_ => authorization_server_metadata_url(&auth.issuer),
@@ -499,34 +573,22 @@ pub(super) async fn authorization_server_metadata(
 	let mut resp: serde_json::Value = from_body_with_limit(upstream.into_body(), limit)
 		.await
 		.map_err(ProxyError::Body)?;
+
 	match &auth.provider {
 		Some(McpIDP::Auth0 {}) | Some(McpIDP::Okta {}) => {
-			// Auth0 and Okta do not support RFC 8707 resource indicators.
-			// When the IDP metadata contains authorization_endpoint, prepend the audience.
-			// When oidcProxy is configured, rewrite_as_metadata will replace these endpoints
-			// with gateway-proxied URLs, so a missing field from the IDP is not fatal.
 			if let Some(serde_json::Value::String(ae)) =
 				json::traverse_mut(&mut resp, &["authorization_endpoint"])
 			{
 				if let Some(aud) = auth.audiences.first() {
 					ae.push_str(&format!("?audience={}", aud));
 				}
-			} else if auth.oidc_proxy.is_none() {
+			} else {
 				return Err(ProxyError::ProcessingString(
 					"authorization_endpoint missing from IDP metadata".to_string(),
 				));
 			}
 		},
 		Some(McpIDP::Keycloak { .. }) => {
-			// Keycloak does not support RFC 8707.
-			// We do not currently have a workload :-(
-			// users will have to hardcode the audience.
-			// https://github.com/keycloak/keycloak/issues/10169 and https://github.com/keycloak/keycloak/issues/14355
-
-			// Keycloak doesn't do CORS for client registrations
-			// https://github.com/keycloak/keycloak/issues/39629
-			// We can workaround this by proxying it
-
 			let current_uri = req
 				.extensions()
 				.get::<filters::OriginalUrl>()
@@ -544,19 +606,36 @@ pub(super) async fn authorization_server_metadata(
 		_ => {},
 	}
 
-	super::oidc_proxy::rewrite_as_metadata(&mut resp, req, auth);
+	Ok(resp)
+}
 
-	let response = ::http::Response::builder()
-		.status(StatusCode::OK)
-		.header("content-type", "application/json")
-		.header("access-control-allow-origin", "*")
-		.header("access-control-allow-methods", "GET, OPTIONS")
-		.header("access-control-allow-headers", "content-type")
-		.body(axum::body::Body::from(Bytes::from(
-			serde_json::to_string(&resp).map_err(|e| ProxyError::Body(crate::http::Error::new(e)))?,
-		)))?;
+/// Derive the public-facing base URL from the request, respecting reverse-proxy
+/// headers (X-Forwarded-Proto, X-Forwarded-Host, Forwarded) so that metadata
+/// endpoints advertise HTTPS URLs when served behind TLS termination (e.g. Fly.io).
+pub(crate) fn derive_public_base_url(req: &Request) -> String {
+	let uri = req
+		.extensions()
+		.get::<filters::OriginalUrl>()
+		.map(|u| u.0.clone())
+		.unwrap_or_else(|| req.uri().clone());
 
-	Ok(response)
+	let scheme = req
+		.headers()
+		.get("x-forwarded-proto")
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https"));
+
+	let host = req
+		.headers()
+		.get("x-forwarded-host")
+		.and_then(|v| v.to_str().ok())
+		.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
+		.or_else(|| uri.host())
+		.unwrap_or("localhost");
+
+	let path = uri.path();
+
+	format!("{scheme}://{host}{path}")
 }
 
 pub(super) async fn client_registration(
@@ -835,6 +914,74 @@ mod tests {
 				"path should be exempt from JWT: {path}"
 			);
 		}
+	}
+
+	fn test_auth_for_metadata(issuer: &str) -> McpAuthentication {
+		McpAuthentication {
+			issuer: issuer.into(),
+			audiences: vec!["urn:test".into()],
+			provider: None,
+			resource_metadata: crate::types::agent::ResourceMetadata {
+				extra: std::collections::BTreeMap::new(),
+			},
+			jwt_validator: std::sync::Arc::new(
+				crate::http::jwt::Jwt::from_providers(vec![], crate::http::jwt::Mode::Strict),
+			),
+			mode: crate::types::agent::McpAuthenticationMode::Strict,
+			oidc_proxy: None,
+		}
+	}
+
+	#[test]
+	fn gateway_as_metadata_has_required_fields_and_no_error_keys() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/.well-known/oauth-authorization-server")
+			.header("host", "gw.example")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().expect("must be object");
+
+		assert!(obj.get("issuer").and_then(|v| v.as_str()).is_some(), "issuer required");
+		assert!(obj.get("authorization_endpoint").and_then(|v| v.as_str()).is_some());
+		assert!(obj.get("token_endpoint").and_then(|v| v.as_str()).is_some());
+		assert!(obj.get("registration_endpoint").and_then(|v| v.as_str()).is_some());
+		assert!(obj.get("code_challenge_methods_supported").is_some());
+		assert!(obj.get("grant_types_supported").is_some());
+		assert!(obj.get("response_types_supported").is_some());
+		assert!(obj.get("token_endpoint_auth_methods_supported").is_some());
+
+		assert!(obj.get("errorCode").is_none(), "no Okta error envelope keys");
+		assert!(obj.get("errorSummary").is_none(), "no Okta error envelope keys");
+		assert!(obj.get("errorLink").is_none(), "no Okta error envelope keys");
+	}
+
+	#[test]
+	fn gateway_as_metadata_respects_forwarded_proto() {
+		let req = ::http::Request::builder()
+			.uri("http://gw.fly.dev/.well-known/oauth-authorization-server")
+			.header("host", "gw.fly.dev")
+			.header("x-forwarded-proto", "https")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().unwrap();
+
+		let issuer = obj["issuer"].as_str().unwrap();
+		assert!(issuer.starts_with("https://"), "issuer must be HTTPS: {issuer}");
+
+		let authz = obj["authorization_endpoint"].as_str().unwrap();
+		assert!(authz.starts_with("https://"), "authorization_endpoint must be HTTPS: {authz}");
+
+		let token = obj["token_endpoint"].as_str().unwrap();
+		assert!(token.starts_with("https://"), "token_endpoint must be HTTPS: {token}");
+
+		let reg = obj["registration_endpoint"].as_str().unwrap();
+		assert!(reg.starts_with("https://"), "registration_endpoint must be HTTPS: {reg}");
 	}
 
 	#[test]
