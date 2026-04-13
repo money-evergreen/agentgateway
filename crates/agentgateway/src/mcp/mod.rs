@@ -1,4 +1,6 @@
 pub(crate) mod auth;
+#[cfg(test)]
+mod e2e_tests;
 mod handler;
 mod mergestream;
 pub(crate) mod oidc_proxy;
