@@ -251,6 +251,13 @@ pub(super) async fn revoke_client(store: &RedisProxyStore, client_id: &str) -> (
 }
 
 #[derive(serde::Deserialize)]
+struct IdpMetadataRaw {
+	authorization_endpoint: Option<String>,
+	token_endpoint: Option<String>,
+	#[allow(dead_code)]
+	issuer: Option<String>,
+}
+
 struct IdpMetadata {
 	authorization_endpoint: String,
 	token_endpoint: String,
@@ -634,19 +641,56 @@ async fn fetch_idp_metadata(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<IdpMetadata, ProxyError> {
+	let issuer = auth.issuer.trim_end_matches('/');
 	let metadata_uri = match &auth.provider {
-		Some(McpIDP::Keycloak { .. }) => openid_configuration_metadata_url(&auth.issuer),
-		_ => authorization_server_metadata_url(&auth.issuer),
+		Some(McpIDP::Keycloak { .. }) => openid_configuration_metadata_url(issuer),
+		_ => authorization_server_metadata_url(issuer),
 	};
 	let ureq = ::http::Request::builder()
-		.uri(metadata_uri)
+		.uri(&metadata_uri)
 		.body(Body::empty())?;
 	let upstream = client.simple_call(ureq).await?;
 	let limit = crate::http::response_buffer_limit(&upstream);
-	let metadata: IdpMetadata = from_body_with_limit(upstream.into_body(), limit)
+	let raw: IdpMetadataRaw = from_body_with_limit(upstream.into_body(), limit)
 		.await
 		.map_err(ProxyError::Body)?;
-	Ok(metadata)
+
+	let authorization_endpoint = raw.authorization_endpoint.unwrap_or_else(|| {
+		let fallback = match &auth.provider {
+			Some(McpIDP::Okta { .. }) => format!("{issuer}/v1/authorize"),
+			Some(McpIDP::Keycloak { .. }) => {
+				format!("{issuer}/protocol/openid-connect/auth")
+			},
+			_ => format!("{issuer}/authorize"),
+		};
+		warn!(
+			issuer = %issuer,
+			fallback = %fallback,
+			"IDP metadata missing authorization_endpoint; using issuer-derived fallback"
+		);
+		fallback
+	});
+
+	let token_endpoint = raw.token_endpoint.unwrap_or_else(|| {
+		let fallback = match &auth.provider {
+			Some(McpIDP::Okta { .. }) => format!("{issuer}/v1/token"),
+			Some(McpIDP::Keycloak { .. }) => {
+				format!("{issuer}/protocol/openid-connect/token")
+			},
+			_ => format!("{issuer}/token"),
+		};
+		warn!(
+			issuer = %issuer,
+			fallback = %fallback,
+			"IDP metadata missing token_endpoint; using issuer-derived fallback"
+		);
+		fallback
+	});
+
+	Ok(IdpMetadata {
+		authorization_endpoint,
+		token_endpoint,
+	})
 }
 
 async fn exchange_code_at_idp(
@@ -921,6 +965,30 @@ mod tests {
 			msg.contains("timeout") || msg.contains("connection") || msg.contains("Connection refused"),
 			"should fail with connection error: {msg}"
 		);
+	}
+
+	#[test]
+	fn idp_metadata_parses_with_all_fields() {
+		let json = r#"{"issuer":"https://idp.example","authorization_endpoint":"https://idp.example/authorize","token_endpoint":"https://idp.example/token"}"#;
+		let raw: IdpMetadataRaw = serde_json::from_str(json).expect("parse");
+		assert_eq!(raw.authorization_endpoint.as_deref(), Some("https://idp.example/authorize"));
+		assert_eq!(raw.token_endpoint.as_deref(), Some("https://idp.example/token"));
+	}
+
+	#[test]
+	fn idp_metadata_parses_with_missing_endpoints() {
+		let json = r#"{"issuer":"https://idp.example"}"#;
+		let raw: IdpMetadataRaw = serde_json::from_str(json).expect("parse");
+		assert!(raw.authorization_endpoint.is_none());
+		assert!(raw.token_endpoint.is_none());
+	}
+
+	#[test]
+	fn idp_metadata_parses_empty_object() {
+		let json = r#"{}"#;
+		let raw: IdpMetadataRaw = serde_json::from_str(json).expect("parse");
+		assert!(raw.authorization_endpoint.is_none());
+		assert!(raw.token_endpoint.is_none());
 	}
 
 	#[test]
