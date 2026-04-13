@@ -94,6 +94,13 @@ struct LocalClientRegistry {
 	by_id: HashMap<String, LocalClientRegistrationRecord>,
 }
 
+fn is_loopback_host(host: Option<&str>) -> bool {
+	matches!(
+		host,
+		Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+	)
+}
+
 impl LocalClientRegistrationRequest {
 	fn validate_and_normalize(mut self) -> Result<Self, String> {
 		if self.redirect_uris.is_empty() {
@@ -103,8 +110,16 @@ impl LocalClientRegistrationRequest {
 		for uri in self.redirect_uris {
 			let parsed = url::Url::parse(&uri)
 				.map_err(|e| format!("redirect_uris must be absolute URLs: {e}"))?;
-			if !matches!(parsed.scheme(), "http" | "https") {
-				return Err("redirect_uris must use http or https".into());
+			let scheme = parsed.scheme();
+			if scheme.is_empty() {
+				return Err("redirect_uris must have a non-empty scheme".into());
+			}
+			if scheme == "http" && !is_loopback_host(parsed.host_str()) {
+				return Err(format!(
+					"http redirect_uris are only allowed for loopback addresses \
+					 (localhost, 127.0.0.1, [::1]); got host '{}'",
+					parsed.host_str().unwrap_or("<none>")
+				));
 			}
 			normalized_redirects.insert(parsed.to_string());
 		}
@@ -1162,5 +1177,71 @@ mod tests {
 		.expect("parse");
 		let err = request.validate_and_normalize().unwrap_err();
 		assert!(err.contains("redirect_uris"), "error mentions the invalid field: {err}");
+	}
+
+	#[test]
+	fn redirect_uri_accepts_custom_scheme() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["cursor://oauth/callback"]
+		}))
+		.expect("parse");
+		let normalized = req.validate_and_normalize().expect("custom scheme must be accepted");
+		assert_eq!(normalized.redirect_uris, vec!["cursor://oauth/callback"]);
+	}
+
+	#[test]
+	fn redirect_uri_accepts_vscode_scheme() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["vscode://extension.callback"]
+		}))
+		.expect("parse");
+		req.validate_and_normalize().expect("vscode scheme must be accepted");
+	}
+
+	#[test]
+	fn redirect_uri_accepts_https() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example.com/callback"]
+		}))
+		.expect("parse");
+		req.validate_and_normalize().expect("https must be accepted");
+	}
+
+	#[test]
+	fn redirect_uri_accepts_localhost_http() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["http://localhost:7777/callback"]
+		}))
+		.expect("parse");
+		req.validate_and_normalize().expect("localhost http must be accepted");
+	}
+
+	#[test]
+	fn redirect_uri_accepts_loopback_ipv4_http() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["http://127.0.0.1:9999/callback"]
+		}))
+		.expect("parse");
+		req.validate_and_normalize().expect("127.0.0.1 http must be accepted");
+	}
+
+	#[test]
+	fn redirect_uri_rejects_non_loopback_http() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["http://evil.example.com/steal"]
+		}))
+		.expect("parse");
+		let err = req.validate_and_normalize().unwrap_err();
+		assert!(err.contains("loopback"), "must mention loopback restriction: {err}");
+	}
+
+	#[test]
+	fn redirect_uri_rejects_malformed() {
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["not-a-valid-uri"]
+		}))
+		.expect("parse");
+		let err = req.validate_and_normalize().unwrap_err();
+		assert!(err.contains("redirect_uris"), "must mention redirect_uris: {err}");
 	}
 }
