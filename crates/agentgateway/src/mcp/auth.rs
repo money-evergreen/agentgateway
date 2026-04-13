@@ -463,8 +463,9 @@ pub(super) async fn authorization_server_metadata(
 		.await
 		.map_err(ProxyError::Body)?;
 	match &auth.provider {
-		Some(McpIDP::Auth0 {}) => {
-			// Auth0 does not support RFC 8707. We can workaround this by prepending an audience
+		Some(McpIDP::Auth0 {}) | Some(McpIDP::Okta {}) => {
+			// Auth0 and Okta do not support RFC 8707 resource indicators.
+			// Workaround: prepend the audience as a query parameter on the authorization endpoint.
 			let Some(serde_json::Value::String(ae)) =
 				json::traverse_mut(&mut resp, &["authorization_endpoint"])
 			else {
@@ -472,7 +473,6 @@ pub(super) async fn authorization_server_metadata(
 					"authorization_endpoint missing".to_string(),
 				));
 			};
-			// If the user provided multiple audiences with auth0, just prepend the first one
 			if let Some(aud) = auth.audiences.first() {
 				ae.push_str(&format!("?audience={}", aud));
 			}

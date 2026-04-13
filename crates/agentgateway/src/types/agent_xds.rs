@@ -249,6 +249,9 @@ fn convert_mcp_provider(provider: i32) -> Option<McpIDP> {
 		x if x == proto::agent::backend_policy_spec::mcp_authentication::McpIdp::Keycloak as i32 => {
 			Some(McpIDP::Keycloak {})
 		},
+		x if x == proto::agent::backend_policy_spec::mcp_authentication::McpIdp::Okta as i32 => {
+			Some(McpIDP::Okta {})
+		},
 		_ => None,
 	}
 }

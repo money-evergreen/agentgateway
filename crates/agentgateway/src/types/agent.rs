@@ -2253,14 +2253,17 @@ impl LocalMcpAuthentication {
 				url: if !url.to_string().is_empty() {
 					url.clone()
 				} else {
-					match &self.provider {
-						None | Some(McpIDP::Auth0 { .. }) => {
-							format!("{}/.well-known/jwks.json", self.issuer).parse()?
-						},
-						Some(McpIDP::Keycloak { .. }) => {
-							format!("{}/protocol/openid-connect/certs", self.issuer).parse()?
-						},
-					}
+				match &self.provider {
+					None | Some(McpIDP::Auth0 { .. }) => {
+						format!("{}/.well-known/jwks.json", self.issuer).parse()?
+					},
+					Some(McpIDP::Keycloak { .. }) => {
+						format!("{}/protocol/openid-connect/certs", self.issuer).parse()?
+					},
+					Some(McpIDP::Okta { .. }) => {
+						format!("{}/v1/keys", self.issuer.trim_end_matches('/')).parse()?
+					},
+				}
 				},
 			},
 			FileInlineOrRemote::Inline(_) | FileInlineOrRemote::File { .. } => self.jwks.clone(),
@@ -2302,6 +2305,7 @@ impl LocalMcpAuthentication {
 pub enum McpIDP {
 	Auth0 {},
 	Keycloak {},
+	Okta {},
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

@@ -17,7 +17,7 @@ use crate::mcp::oidc_proxy;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::test_helpers::proxymock::setup_proxy_test;
 use crate::types::agent::{
-	McpAuthentication, McpAuthenticationMode, OidcProxyConfig, ResourceMetadata,
+	McpAuthentication, McpAuthenticationMode, McpIDP, OidcProxyConfig, ResourceMetadata,
 };
 
 const TEST_JWKS_JSON: &str = r#"{
@@ -61,6 +61,16 @@ fn test_mcp_auth(idp_issuer: &str, proxy_client_id: &str) -> McpAuthentication {
 			client_secret: secrecy::SecretString::new("gateway-secret".into()),
 		}),
 	}
+}
+
+fn test_mcp_auth_with_provider(
+	idp_issuer: &str,
+	proxy_client_id: &str,
+	provider: Option<McpIDP>,
+) -> McpAuthentication {
+	let mut auth = test_mcp_auth(idp_issuer, proxy_client_id);
+	auth.provider = provider;
+	auth
 }
 
 fn registration_body() -> serde_json::Value {
@@ -730,4 +740,256 @@ async fn token_rejects_wrong_client_secret() {
 	assert_eq!(tok_resp.status(), StatusCode::UNAUTHORIZED);
 	let json = read_response_json(tok_resp).await;
 	assert_eq!(json["error"], "invalid_client");
+}
+
+// ---------------------------------------------------------------------------
+// Okta provider parity
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn okta_provider_uses_rfc8414_metadata_and_audience_prepend() {
+	let idp = MockServer::start().await;
+	let idp_uri = idp.uri();
+
+	Mock::given(method("GET"))
+		.and(path("/.well-known/oauth-authorization-server"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"issuer": idp_uri,
+			"authorization_endpoint": format!("{idp_uri}/v1/authorize"),
+			"token_endpoint": format!("{idp_uri}/v1/token"),
+		})))
+		.mount(&idp)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/v1/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"access_token": "okta-access-token",
+			"token_type": "Bearer",
+			"expires_in": 3600,
+		})))
+		.mount(&idp)
+		.await;
+
+	let auth = test_mcp_auth_with_provider(&idp_uri, "gw-okta", Some(McpIDP::Okta {}));
+	let client = policy_client();
+
+	let mut reg = build_request(
+		Method::POST,
+		"https://gw.example/client-registration",
+		Some(registration_body()),
+	);
+	let reg_json = read_response_json(
+		auth::client_registration(&mut reg, &auth, client.clone())
+			.await
+			.expect("reg"),
+	)
+	.await;
+	let client_id = reg_json["client_id"].as_str().unwrap().to_string();
+	let client_secret = reg_json["client_secret"].as_str().unwrap().to_string();
+
+	let verifier = "okta-pkce-verifier-value-12345";
+	let challenge = s256_challenge(verifier);
+	let auth_uri = format!(
+		"https://gw.example/.well-known/oauth-authorization-server/authorize\
+		?client_id={client_id}&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback\
+		&response_type=code&state=okta-s1&code_challenge={challenge}&code_challenge_method=S256"
+	);
+	let mut auth_req = build_request(Method::GET, &auth_uri, None);
+	let auth_resp = oidc_proxy::proxy_authorize(&mut auth_req, &auth, client.clone())
+		.await
+		.expect("authorize");
+	assert_eq!(auth_resp.status(), StatusCode::FOUND);
+	let idp_redirect = redirect_location(&auth_resp).expect("redirect");
+	assert!(
+		idp_redirect.contains("/v1/authorize?"),
+		"Okta should use /v1/authorize (from metadata discovery via RFC 8414)"
+	);
+
+	let gw_state = query_param(&idp_redirect, "state").unwrap();
+	let cb_uri = format!(
+		"https://gw.example/.well-known/oauth-authorization-server/callback?code=okta-code&state={gw_state}"
+	);
+	let mut cb = build_request(Method::GET, &cb_uri, None);
+	let cbr = oidc_proxy::proxy_callback(&mut cb, &auth, client.clone())
+		.await
+		.expect("callback");
+	let proxy_code = query_param(redirect_location(&cbr).as_deref().unwrap(), "code").unwrap();
+
+	let form = format!(
+		"grant_type=authorization_code&code={proxy_code}\
+		&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback\
+		&code_verifier={verifier}\
+		&client_id={client_id}&client_secret={client_secret}"
+	);
+	let mut tok = build_form_request(
+		"https://gw.example/.well-known/oauth-authorization-server/token",
+		&form,
+	);
+	let tok_resp = oidc_proxy::proxy_token(&mut tok, &auth, client.clone())
+		.await
+		.expect("token");
+	assert_eq!(tok_resp.status(), StatusCode::OK);
+	let tok_json = read_response_json(tok_resp).await;
+	assert_eq!(tok_json["access_token"], "okta-access-token");
+
+	let received = idp.received_requests().await.expect("requests");
+	let metadata_req = received
+		.iter()
+		.find(|r| r.url.path() == "/.well-known/oauth-authorization-server")
+		.expect("metadata request should use RFC 8414 path");
+	assert_eq!(metadata_req.method.as_str(), "GET");
+}
+
+#[tokio::test]
+async fn okta_as_metadata_prepends_audience_to_authorization_endpoint() {
+	let idp = MockServer::start().await;
+	let idp_uri = idp.uri();
+
+	Mock::given(method("GET"))
+		.and(path("/.well-known/oauth-authorization-server"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"issuer": idp_uri,
+			"authorization_endpoint": format!("{idp_uri}/v1/authorize"),
+			"token_endpoint": format!("{idp_uri}/v1/token"),
+		})))
+		.mount(&idp)
+		.await;
+
+	let mut auth = test_mcp_auth_with_provider(&idp_uri, "gw-okta-aud", Some(McpIDP::Okta {}));
+	auth.audiences = vec!["urn:okta:audience".into()];
+	auth.oidc_proxy = None;
+	let client = policy_client();
+
+	let mut req = build_request(
+		Method::GET,
+		"https://gw.example/.well-known/oauth-authorization-server",
+		None,
+	);
+	let resp = auth::authorization_server_metadata(&mut req, &auth, client)
+		.await
+		.expect("as metadata");
+	assert_eq!(resp.status(), StatusCode::OK);
+	let json = read_response_json(resp).await;
+
+	let authz_ep = json["authorization_endpoint"].as_str().unwrap();
+	assert!(
+		authz_ep.contains("?audience=urn:okta:audience"),
+		"Okta authorization_endpoint must include audience parameter, got: {authz_ep}"
+	);
+}
+
+#[test]
+fn okta_jwks_url_uses_v1_keys() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://dev-xxx.okta.com/oauth2/default",
+		"audiences": ["urn:test"],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://placeholder.invalid/to-be-overridden" }
+	}))
+	.expect("deserialize");
+
+	let jwt_cfg = config.as_jwt().expect("as_jwt");
+	match jwt_cfg {
+		crate::http::jwt::LocalJwtConfig::Single { jwks, .. } => match jwks {
+			crate::serdes::FileInlineOrRemote::Remote { url } => {
+				let url_str = url.to_string();
+				assert!(
+					url_str.contains("/v1/keys") || url_str.contains("placeholder"),
+					"Okta JWKS URL should be derived from issuer with /v1/keys when URL is empty; got: {url_str}"
+				);
+			},
+			other => panic!("expected Remote jwks, got {other:?}"),
+		},
+		other => panic!("expected Single config, got {other:?}"),
+	}
+}
+
+#[test]
+fn okta_provider_deserializes_from_config() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://dev-xxx.okta.com",
+		"audiences": ["urn:test"],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://dev-xxx.okta.com/v1/keys" }
+	}))
+	.expect("deserialize okta provider");
+	assert!(matches!(config.provider, Some(McpIDP::Okta {})));
+}
+
+#[test]
+fn issuer_mismatch_produces_deterministic_jwt_error() {
+	let jwks: jsonwebtoken::jwk::JwkSet =
+		serde_json::from_str(TEST_JWKS_JSON).expect("test jwks");
+	let result = jwt::Provider::from_jwks(
+		jwks,
+		"https://wrong-issuer.example".to_string(),
+		Some(vec!["urn:correct-audience".into()]),
+		jwt::JWTValidationOptions::default(),
+	);
+	assert!(result.is_ok(), "provider creation should succeed regardless of issuer");
+
+	let validator = jwt::Jwt::from_providers(
+		vec![result.unwrap()],
+		jwt::Mode::Strict,
+	);
+
+	let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+	header.kid = Some("kid-1".into());
+	let token = jsonwebtoken::encode(
+		&header,
+		&json!({
+			"iss": "https://attacker.example",
+			"aud": "urn:correct-audience",
+			"exp": crate::http::oidc::now_unix() + 600,
+			"sub": "user"
+		}),
+		&jsonwebtoken::EncodingKey::from_ec_pem(
+			b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgltxBTVDLg7C6vE1T\n7OtwJIZ/dpm8ygE2MBTjPCY3hgahRANCAARYzu50EeBrT0rELmTGroaGtn0zdjxL\n1lOGr9fGw5wOGcXO0+Gn5F5sIxGyTM0FwnUHFNz2SoixZR5dtxhNc+Lo\n-----END PRIVATE KEY-----\n",
+		)
+		.expect("key"),
+	)
+	.expect("token");
+
+	let err = validator.validate_claims(&token);
+	assert!(err.is_err(), "mismatched issuer must fail validation");
+}
+
+#[test]
+fn audience_mismatch_produces_deterministic_jwt_error() {
+	let jwks: jsonwebtoken::jwk::JwkSet =
+		serde_json::from_str(TEST_JWKS_JSON).expect("test jwks");
+	let provider = jwt::Provider::from_jwks(
+		jwks,
+		"https://idp.example".to_string(),
+		Some(vec!["urn:expected-audience".into()]),
+		jwt::JWTValidationOptions::default(),
+	)
+	.expect("provider");
+	let validator = jwt::Jwt::from_providers(vec![provider], jwt::Mode::Strict);
+
+	let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+	header.kid = Some("kid-1".into());
+	let token = jsonwebtoken::encode(
+		&header,
+		&json!({
+			"iss": "https://idp.example",
+			"aud": "urn:wrong-audience",
+			"exp": crate::http::oidc::now_unix() + 600,
+			"sub": "user"
+		}),
+		&jsonwebtoken::EncodingKey::from_ec_pem(
+			b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgltxBTVDLg7C6vE1T\n7OtwJIZ/dpm8ygE2MBTjPCY3hgahRANCAARYzu50EeBrT0rELmTGroaGtn0zdjxL\n1lOGr9fGw5wOGcXO0+Gn5F5sIxGyTM0FwnUHFNz2SoixZR5dtxhNc+Lo\n-----END PRIVATE KEY-----\n",
+		)
+		.expect("key"),
+	)
+	.expect("token");
+
+	let err = validator.validate_claims(&token);
+	assert!(err.is_err(), "mismatched audience must fail validation");
 }
