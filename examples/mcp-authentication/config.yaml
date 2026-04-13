@@ -133,6 +133,67 @@ binds:
             - query
             resourceDocumentation: http://localhost:3000/keycloak/docs
             resourcePolicyUri: http://localhost:3000/keycloak/policies
+    # --- Scenario D: Local stdio MCP + Okta IDP
+    # When the IDP is Okta, the provider: okta adapter handles:
+    #   - JWKS URL derivation via {issuer}/v1/keys
+    #   - Audience prepend on the authorization endpoint (no RFC 8707)
+    #   - AS metadata via RFC 8414 (standard /.well-known/oauth-authorization-server)
+    #
+    # Required environment contracts:
+    #   OKTA_ISSUER     — Okta authorization server URL (e.g. https://dev-xxx.okta.com/oauth2/default)
+    #   OKTA_AUDIENCE   — Audience identifier registered in Okta
+    #   OKTA_CLIENT_ID  — Gateway's OAuth2 client ID registered in Okta (for oidcProxy)
+    #   OKTA_CLIENT_SECRET — Gateway's OAuth2 client secret (for oidcProxy)
+    #
+    # Example (uncomment and set env values to use):
+    # - backends:
+    #     - mcp:
+    #         targets:
+    #         - name: everything
+    #           stdio:
+    #             args:
+    #             - '@modelcontextprotocol/server-everything'
+    #             cmd: npx
+    #   matches:
+    #   - path:
+    #       exact: /okta/mcp
+    #   - path:
+    #       exact: /.well-known/oauth-protected-resource/okta/mcp
+    #   - path:
+    #       exact: /.well-known/oauth-authorization-server/okta/mcp
+    #   - path:
+    #       prefix: /.well-known/oauth-authorization-server/okta/mcp/
+    #   policies:
+    #     cors:
+    #       allowHeaders:
+    #       - mcp-protocol-version
+    #       - content-type
+    #       allowOrigins:
+    #       - '*'
+    #       exposeHeaders:
+    #       - "Mcp-Session-Id"
+    #     mcpAuthentication:
+    #       mode: strict
+    #       issuer: https://dev-xxx.okta.com/oauth2/default
+    #       audiences:
+    #       - urn:agentgateway
+    #       provider:
+    #         okta: {}
+    #       jwks:
+    #         url: https://dev-xxx.okta.com/oauth2/default/v1/keys
+    #       oidcProxy:
+    #         clientId: gateway-okta-client-id
+    #         clientSecret: gateway-okta-client-secret
+    #       resourceMetadata:
+    #         resource: http://localhost:3000/okta/mcp
+    #         scopesSupported:
+    #         - openid
+    #         - profile
+    #         - offline_access
+    #         bearerMethodsSupported:
+    #         - header
+    #         resourceDocumentation: http://localhost:3000/okta/docs
+    #         resourcePolicyUri: http://localhost:3000/okta/policies
             # Example configuration for Auth0:
             # - backends:
             #   - mcp:

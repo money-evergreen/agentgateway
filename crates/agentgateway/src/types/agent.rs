@@ -2278,11 +2278,41 @@ impl LocalMcpAuthentication {
 		})
 	}
 
+	/// Validate provider-specific configuration requirements.
+	/// Fails fast with a clear diagnostic message when required fields are missing or invalid.
+	pub fn validate_provider_config(&self) -> anyhow::Result<()> {
+		if let Some(McpIDP::Okta { .. }) = &self.provider {
+			if self.audiences.is_empty() {
+				anyhow::bail!(
+					"mcpAuthentication with provider: okta requires at least one audience; \
+					 Okta does not support RFC 8707 resource indicators and relies on the \
+					 audience claim for token validation"
+				);
+			}
+			if self.issuer.is_empty() {
+				anyhow::bail!(
+					"mcpAuthentication with provider: okta requires a non-empty issuer \
+					 (e.g. https://dev-xxx.okta.com/oauth2/default)"
+				);
+			}
+			if let Some(ref proxy) = self.oidc_proxy
+				&& proxy.client_id.is_empty()
+			{
+				anyhow::bail!(
+					"mcpAuthentication.oidcProxy.clientId must not be empty \
+					 when provider: okta is configured with OIDC proxy"
+				);
+			}
+		}
+		Ok(())
+	}
+
 	/// Translate the local (file/env) config into a runtime `McpAuthentication` with a ready validator.
 	pub async fn translate(
 		&self,
 		client: crate::client::Client,
 	) -> anyhow::Result<McpAuthentication> {
+		self.validate_provider_config()?;
 		let jwt_cfg = self.as_jwt()?;
 		let jwt = jwt_cfg.try_into(client).await?;
 		let oidc_proxy = self.oidc_proxy.as_ref().map(|p| OidcProxyConfig {
