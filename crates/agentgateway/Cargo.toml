@@ -97,6 +97,7 @@ prost.workspace = true
 rand.workspace = true
 libc.workspace = true
 rcgen.workspace = true
+redis.workspace = true
 regex.workspace = true
 
 rmcp = { version = "1.3", features = [

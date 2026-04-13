@@ -630,7 +630,12 @@ pub(super) async fn client_registration(
 			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
 			.deactivate(client_id)
 			.map_err(ProxyError::ProcessingString)?;
-		let revoked = super::oidc_proxy::revoke_client(&deactivated.client_id);
+		let revoked = match &auth.oidc_proxy {
+			Some(proxy) => {
+				super::oidc_proxy::revoke_client(&proxy.store, &deactivated.client_id).await
+			},
+			None => (0, 0),
+		};
 		info!(
 			client_id = %deactivated.client_id,
 			transactions_revoked = revoked.0,

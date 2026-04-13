@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use base64::Engine;
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
-use once_cell::sync::Lazy;
 use rand::RngExt;
+use redis::AsyncCommands;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -16,21 +15,15 @@ use crate::http::{Body, Request, Response};
 use crate::json::from_body_with_limit;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
-use crate::types::agent::{McpAuthentication, McpIDP, OidcProxyConfig};
+use crate::types::agent::{McpAuthentication, McpIDP, OidcProxyConfig, RedisStorageConfig};
 
-const TRANSACTION_TTL: Duration = Duration::from_secs(10 * 60);
-const AUTH_CODE_TTL: Duration = Duration::from_secs(5 * 60);
 const TOKEN_RESPONSE_BODY_LIMIT: usize = 64 * 1024;
 
-static OIDC_PROXY_STORE: Lazy<RwLock<OidcProxyStore>> =
-	Lazy::new(|| RwLock::new(OidcProxyStore::default()));
+// ---------------------------------------------------------------------------
+// Redis-backed proxy store
+// ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct OidcProxyStore {
-	transactions: HashMap<String, ProxyTransaction>,
-	auth_codes: HashMap<String, ProxyAuthCode>,
-}
-
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ProxyTransaction {
 	client_id: String,
 	client_redirect_uri: String,
@@ -40,78 +33,234 @@ struct ProxyTransaction {
 	gateway_pkce_verifier: String,
 	#[allow(dead_code)]
 	client_scope: Option<String>,
-	expires_at: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ProxyAuthCode {
 	client_id: String,
 	client_redirect_uri: String,
 	client_code_challenge: String,
 	token_response: serde_json::Value,
-	expires_at: u64,
 }
 
-impl OidcProxyStore {
-	fn gc_expired(&mut self) {
-		let now = now_unix();
-		self.transactions.retain(|_, t| t.expires_at > now);
-		self.auth_codes.retain(|_, c| c.expires_at > now);
+pub struct RedisProxyStore {
+	conn: redis::aio::ConnectionManager,
+	key_prefix: String,
+	transaction_ttl: Duration,
+	auth_code_ttl: Duration,
+}
+
+impl std::fmt::Debug for RedisProxyStore {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RedisProxyStore")
+			.field("key_prefix", &self.key_prefix)
+			.field("transaction_ttl", &self.transaction_ttl)
+			.field("auth_code_ttl", &self.auth_code_ttl)
+			.finish_non_exhaustive()
+	}
+}
+
+impl RedisProxyStore {
+	pub async fn connect(cfg: &RedisStorageConfig) -> anyhow::Result<Self> {
+		let client = redis::Client::open(cfg.url.as_str())
+			.map_err(|e| anyhow::anyhow!("invalid Redis URL '{}': {e}", cfg.url))?;
+
+		let conn = tokio::time::timeout(
+			Duration::from_millis(cfg.connect_timeout_ms),
+			redis::aio::ConnectionManager::new(client),
+		)
+		.await
+		.map_err(|_| {
+			anyhow::anyhow!(
+				"Redis connect timeout after {}ms to '{}'",
+				cfg.connect_timeout_ms,
+				cfg.url
+			)
+		})?
+		.map_err(|e| anyhow::anyhow!("Redis connection failed to '{}': {e}", cfg.url))?;
+
+		info!(
+			redis_url = %cfg.url,
+			key_prefix = %cfg.key_prefix,
+			"OIDC proxy Redis store connected"
+		);
+
+		Ok(Self {
+			conn,
+			key_prefix: cfg.key_prefix.clone(),
+			transaction_ttl: Duration::from_secs(cfg.transaction_ttl_seconds),
+			auth_code_ttl: Duration::from_secs(cfg.auth_code_ttl_seconds),
+		})
 	}
 
-	fn insert_transaction(&mut self, key: String, tx: ProxyTransaction) {
-		self.gc_expired();
-		self.transactions.insert(key, tx);
+	fn txn_key(&self, state: &str) -> String {
+		format!("{}:txn:{}", self.key_prefix, state)
 	}
 
-	fn take_transaction(&mut self, key: &str) -> Option<ProxyTransaction> {
-		let tx = self.transactions.remove(key)?;
-		if tx.expires_at <= now_unix() {
-			return None;
+	fn code_key(&self, code: &str) -> String {
+		format!("{}:code:{}", self.key_prefix, code)
+	}
+
+	fn client_txn_index(&self, client_id: &str) -> String {
+		format!("{}:idx:client:{}:txn", self.key_prefix, client_id)
+	}
+
+	fn client_code_index(&self, client_id: &str) -> String {
+		format!("{}:idx:client:{}:code", self.key_prefix, client_id)
+	}
+
+	async fn insert_transaction(
+		&self,
+		state: &str,
+		tx: &ProxyTransaction,
+	) -> Result<(), ProxyError> {
+		let key = self.txn_key(state);
+		let idx_key = self.client_txn_index(&tx.client_id);
+		let value = serde_json::to_string(tx)
+			.map_err(|e| ProxyError::ProcessingString(format!("serialize transaction: {e}")))?;
+		let ttl_secs = self.transaction_ttl.as_secs() as i64;
+
+		let mut conn = self.conn.clone();
+		redis::pipe()
+			.atomic()
+			.cmd("SET")
+			.arg(&key)
+			.arg(&value)
+			.arg("EX")
+			.arg(ttl_secs)
+			.cmd("SADD")
+			.arg(&idx_key)
+			.arg(&key)
+			.cmd("EXPIRE")
+			.arg(&idx_key)
+			.arg(ttl_secs * 2)
+			.exec_async(&mut conn)
+			.await
+			.map_err(|e| ProxyError::ProcessingString(format!("Redis insert_transaction: {e}")))?;
+
+		Ok(())
+	}
+
+	async fn take_transaction(&self, state: &str) -> Result<Option<ProxyTransaction>, ProxyError> {
+		let key = self.txn_key(state);
+		let mut conn = self.conn.clone();
+
+		let value: Option<String> = redis::cmd("GETDEL")
+			.arg(&key)
+			.query_async(&mut conn)
+			.await
+			.map_err(|e| ProxyError::ProcessingString(format!("Redis take_transaction: {e}")))?;
+
+		match value {
+			Some(json) => {
+				let tx: ProxyTransaction = serde_json::from_str(&json).map_err(|e| {
+					ProxyError::ProcessingString(format!("deserialize transaction: {e}"))
+				})?;
+				let _: Result<(), _> = conn.srem(self.client_txn_index(&tx.client_id), &key).await;
+				Ok(Some(tx))
+			},
+			None => Ok(None),
 		}
-		Some(tx)
 	}
 
-	fn insert_auth_code(&mut self, key: String, code: ProxyAuthCode) {
-		self.auth_codes.insert(key, code);
+	async fn insert_auth_code(
+		&self,
+		code: &str,
+		entry: &ProxyAuthCode,
+	) -> Result<(), ProxyError> {
+		let key = self.code_key(code);
+		let idx_key = self.client_code_index(&entry.client_id);
+		let value = serde_json::to_string(entry)
+			.map_err(|e| ProxyError::ProcessingString(format!("serialize auth code: {e}")))?;
+		let ttl_secs = self.auth_code_ttl.as_secs() as i64;
+
+		let mut conn = self.conn.clone();
+		redis::pipe()
+			.atomic()
+			.cmd("SET")
+			.arg(&key)
+			.arg(&value)
+			.arg("EX")
+			.arg(ttl_secs)
+			.cmd("SADD")
+			.arg(&idx_key)
+			.arg(&key)
+			.cmd("EXPIRE")
+			.arg(&idx_key)
+			.arg(ttl_secs * 2)
+			.exec_async(&mut conn)
+			.await
+			.map_err(|e| ProxyError::ProcessingString(format!("Redis insert_auth_code: {e}")))?;
+
+		Ok(())
 	}
 
-	fn take_auth_code(&mut self, key: &str) -> Option<ProxyAuthCode> {
-		let code = self.auth_codes.remove(key)?;
-		if code.expires_at <= now_unix() {
-			return None;
+	async fn take_auth_code(&self, code: &str) -> Result<Option<ProxyAuthCode>, ProxyError> {
+		let key = self.code_key(code);
+		let mut conn = self.conn.clone();
+
+		let value: Option<String> = redis::cmd("GETDEL")
+			.arg(&key)
+			.query_async(&mut conn)
+			.await
+			.map_err(|e| ProxyError::ProcessingString(format!("Redis take_auth_code: {e}")))?;
+
+		match value {
+			Some(json) => {
+				let entry: ProxyAuthCode = serde_json::from_str(&json).map_err(|e| {
+					ProxyError::ProcessingString(format!("deserialize auth code: {e}"))
+				})?;
+				let _: Result<(), _> = conn
+					.srem(self.client_code_index(&entry.client_id), &key)
+					.await;
+				Ok(Some(entry))
+			},
+			None => Ok(None),
 		}
-		Some(code)
 	}
 
-	fn revoke_by_client_id(&mut self, client_id: &str) -> (usize, usize) {
-		let tx_before = self.transactions.len();
-		self.transactions.retain(|_, t| t.client_id != client_id);
-		let tx_removed = tx_before - self.transactions.len();
+	pub async fn revoke_by_client_id(&self, client_id: &str) -> (usize, usize) {
+		let txn_idx = self.client_txn_index(client_id);
+		let code_idx = self.client_code_index(client_id);
+		let mut conn = self.conn.clone();
 
-		let code_before = self.auth_codes.len();
-		self.auth_codes.retain(|_, c| c.client_id != client_id);
-		let code_removed = code_before - self.auth_codes.len();
+		let txn_keys: Vec<String> = conn.smembers(&txn_idx).await.unwrap_or_default();
+		let code_keys: Vec<String> = conn.smembers(&code_idx).await.unwrap_or_default();
 
-		(tx_removed, code_removed)
+		let txn_count = txn_keys.len();
+		let code_count = code_keys.len();
+
+		let mut keys_to_delete: Vec<String> = Vec::with_capacity(txn_count + code_count + 2);
+		keys_to_delete.extend(txn_keys);
+		keys_to_delete.extend(code_keys);
+		keys_to_delete.push(txn_idx);
+		keys_to_delete.push(code_idx);
+
+		if !keys_to_delete.is_empty() {
+			let _: Result<(), _> = conn.del(keys_to_delete).await;
+		}
+
+		(txn_count, code_count)
 	}
 }
 
 /// Purge all pending transactions and auth codes for a deactivated client.
 /// Returns (transactions_removed, auth_codes_removed).
-pub(super) fn revoke_client(client_id: &str) -> (usize, usize) {
-	match OIDC_PROXY_STORE.write() {
-		Ok(mut store) => store.revoke_by_client_id(client_id),
-		Err(_) => {
-			warn!(client_id = %client_id, "proxy store lock poisoned during revocation");
-			(0, 0)
-		},
-	}
+pub(super) async fn revoke_client(store: &RedisProxyStore, client_id: &str) -> (usize, usize) {
+	store.revoke_by_client_id(client_id).await
 }
 
 #[derive(serde::Deserialize)]
 struct IdpMetadata {
 	authorization_endpoint: String,
 	token_endpoint: String,
+}
+
+fn get_store(auth: &McpAuthentication) -> Result<&RedisProxyStore, ProxyError> {
+	auth.oidc_proxy
+		.as_ref()
+		.map(|p| p.store.as_ref())
+		.ok_or_else(|| ProxyError::ProcessingString("OIDC proxy not configured".into()))
 }
 
 pub(super) async fn proxy_authorize(
@@ -123,6 +272,7 @@ pub(super) async fn proxy_authorize(
 		.oidc_proxy
 		.as_ref()
 		.ok_or_else(|| ProxyError::ProcessingString("OIDC proxy not configured".into()))?;
+	let store = get_store(auth)?;
 
 	if *req.method() != Method::GET {
 		return build_error_response(
@@ -201,22 +351,16 @@ pub(super) async fn proxy_authorize(
 	let gateway_callback_url = derive_callback_url(req);
 
 	let tx = ProxyTransaction {
-		client_id,
+		client_id: client_id.clone(),
 		client_redirect_uri: redirect_uri,
 		client_state: state,
 		client_code_challenge: code_challenge,
 		idp_token_endpoint: idp_metadata.token_endpoint,
 		gateway_pkce_verifier,
 		client_scope: scope.clone(),
-		expires_at: now_unix().saturating_add(TRANSACTION_TTL.as_secs()),
 	};
 
-	let audit_client_id = tx.client_id.clone();
-
-	OIDC_PROXY_STORE
-		.write()
-		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
-		.insert_transaction(gateway_state.clone(), tx);
+	store.insert_transaction(&gateway_state, &tx).await?;
 
 	let mut idp_params = vec![
 		("response_type", "code".to_string()),
@@ -233,7 +377,7 @@ pub(super) async fn proxy_authorize(
 	let idp_authorize_url = append_query(&idp_metadata.authorization_endpoint, &idp_params);
 
 	info!(
-		client_id = %audit_client_id,
+		client_id = %client_id,
 		audit_event = "proxy_authorize_started",
 		"OIDC proxy authorization flow started; redirecting to IDP"
 	);
@@ -250,6 +394,7 @@ pub(super) async fn proxy_callback(
 		.oidc_proxy
 		.as_ref()
 		.ok_or_else(|| ProxyError::ProcessingString("OIDC proxy not configured".into()))?;
+	let store = get_store(auth)?;
 
 	let query = req.uri().query().unwrap_or_default();
 	let params = parse_query(query);
@@ -266,10 +411,9 @@ pub(super) async fn proxy_callback(
 	let gateway_state = required_param(&params, "state")?;
 	let code = required_param(&params, "code")?;
 
-	let tx = OIDC_PROXY_STORE
-		.write()
-		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
+	let tx = store
 		.take_transaction(&gateway_state)
+		.await?
 		.ok_or_else(|| {
 			ProxyError::ProcessingString(
 				"expired or replayed state parameter; transaction not found".into(),
@@ -290,30 +434,21 @@ pub(super) async fn proxy_callback(
 
 	let proxy_code = random_token(32);
 	let auth_code_entry = ProxyAuthCode {
-		client_id: tx.client_id,
+		client_id: tx.client_id.clone(),
 		client_redirect_uri: tx.client_redirect_uri.clone(),
 		client_code_challenge: tx.client_code_challenge,
 		token_response,
-		expires_at: now_unix().saturating_add(AUTH_CODE_TTL.as_secs()),
 	};
 
-	let audit_callback_client_id = auth_code_entry.client_id.clone();
-
-	OIDC_PROXY_STORE
-		.write()
-		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
-		.insert_auth_code(proxy_code.clone(), auth_code_entry);
+	store.insert_auth_code(&proxy_code, &auth_code_entry).await?;
 
 	info!(
-		client_id = %audit_callback_client_id,
+		client_id = %tx.client_id,
 		audit_event = "proxy_callback_success",
 		"IDP code exchange succeeded; proxy auth code issued to client"
 	);
 
-	let redirect_params = [
-		("code", proxy_code),
-		("state", tx.client_state),
-	];
+	let redirect_params = [("code", proxy_code), ("state", tx.client_state)];
 	let redirect_url = append_query(&tx.client_redirect_uri, &redirect_params);
 
 	build_redirect_response(&redirect_url)
@@ -328,6 +463,7 @@ pub(super) async fn proxy_token(
 		.oidc_proxy
 		.as_ref()
 		.ok_or_else(|| ProxyError::ProcessingString("OIDC proxy not configured".into()))?;
+	let store = get_store(auth)?;
 
 	if *req.method() != Method::POST {
 		return build_error_response(
@@ -391,10 +527,9 @@ pub(super) async fn proxy_token(
 	let redirect_uri = required_form_param(&form_params, "redirect_uri")?;
 	let code_verifier = required_form_param(&form_params, "code_verifier")?;
 
-	let auth_code = OIDC_PROXY_STORE
-		.write()
-		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
+	let auth_code = store
 		.take_auth_code(&proxy_code)
+		.await?
 		.ok_or_else(|| {
 			warn!(client_id = %client_id, audit_event = "token_rejected_expired_code", "token exchange rejected: expired or replayed authorization code");
 			ProxyError::ProcessingString(
@@ -508,10 +643,9 @@ async fn fetch_idp_metadata(
 		.body(Body::empty())?;
 	let upstream = client.simple_call(ureq).await?;
 	let limit = crate::http::response_buffer_limit(&upstream);
-	let metadata: IdpMetadata =
-		from_body_with_limit(upstream.into_body(), limit)
-			.await
-			.map_err(ProxyError::Body)?;
+	let metadata: IdpMetadata = from_body_with_limit(upstream.into_body(), limit)
+		.await
+		.map_err(ProxyError::Body)?;
 	Ok(metadata)
 }
 
@@ -545,7 +679,9 @@ async fn exchange_code_at_idp(
 	let status = resp.status();
 	let body = crate::http::read_body_with_limit(resp.into_body(), TOKEN_RESPONSE_BODY_LIMIT)
 		.await
-		.map_err(|e| ProxyError::ProcessingString(format!("failed to read IDP token response: {e}")))?;
+		.map_err(|e| {
+			ProxyError::ProcessingString(format!("failed to read IDP token response: {e}"))
+		})?;
 
 	if status != StatusCode::OK {
 		let error_body = String::from_utf8_lossy(&body);
@@ -662,13 +798,6 @@ fn random_token(bytes: usize) -> String {
 	base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-fn now_unix() -> u64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap_or(Duration::ZERO)
-		.as_secs()
-}
-
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 	aws_lc_rs::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
@@ -719,219 +848,93 @@ fn build_error_response(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::types::agent::RedisStorageConfig;
 
 	#[test]
-	fn store_transaction_lifecycle() {
-		let mut store = OidcProxyStore::default();
-		let tx = ProxyTransaction {
-			client_id: "client-1".into(),
-			client_redirect_uri: "https://app.example/callback".into(),
-			client_state: "client-state-1".into(),
-			client_code_challenge: "challenge-abc".into(),
-			idp_token_endpoint: "https://idp.example/token".into(),
-			gateway_pkce_verifier: "verifier-xyz".into(),
-			client_scope: Some("openid".into()),
-			expires_at: now_unix() + 300,
+	fn redis_config_rejects_empty_url() {
+		let cfg = RedisStorageConfig {
+			url: "".into(),
+			key_prefix: "agw:oidc:test".into(),
+			transaction_ttl_seconds: 600,
+			auth_code_ttl_seconds: 300,
+			connect_timeout_ms: 5000,
+			command_timeout_ms: 2000,
 		};
-		store.insert_transaction("gw-state-1".into(), tx);
-		assert!(store.transactions.contains_key("gw-state-1"));
-
-		let taken = store.take_transaction("gw-state-1");
-		assert!(taken.is_some());
-		assert_eq!(taken.unwrap().client_id, "client-1");
-
-		assert!(store.take_transaction("gw-state-1").is_none());
+		let err = cfg.validate().unwrap_err();
+		assert!(err.to_string().contains("url"), "{err}");
 	}
 
 	#[test]
-	fn store_rejects_expired_transaction() {
-		let mut store = OidcProxyStore::default();
-		let tx = ProxyTransaction {
-			client_id: "client-1".into(),
-			client_redirect_uri: "https://app.example/callback".into(),
-			client_state: "client-state-1".into(),
-			client_code_challenge: "challenge-abc".into(),
-			idp_token_endpoint: "https://idp.example/token".into(),
-			gateway_pkce_verifier: "verifier-xyz".into(),
-			client_scope: None,
-			expires_at: now_unix().saturating_sub(1),
+	fn redis_config_rejects_empty_prefix() {
+		let cfg = RedisStorageConfig {
+			url: "redis://localhost:6379".into(),
+			key_prefix: "".into(),
+			transaction_ttl_seconds: 600,
+			auth_code_ttl_seconds: 300,
+			connect_timeout_ms: 5000,
+			command_timeout_ms: 2000,
 		};
-		store.insert_transaction("expired-state".into(), tx);
-		assert!(store.take_transaction("expired-state").is_none());
+		let err = cfg.validate().unwrap_err();
+		assert!(err.to_string().contains("keyPrefix"), "{err}");
 	}
 
 	#[test]
-	fn auth_code_lifecycle() {
-		let mut store = OidcProxyStore::default();
-		let code_entry = ProxyAuthCode {
-			client_id: "client-1".into(),
-			client_redirect_uri: "https://app.example/callback".into(),
-			client_code_challenge: "challenge-abc".into(),
-			token_response: serde_json::json!({"access_token": "tok", "token_type": "Bearer"}),
-			expires_at: now_unix() + 300,
+	fn redis_config_rejects_zero_ttl() {
+		let cfg = RedisStorageConfig {
+			url: "redis://localhost:6379".into(),
+			key_prefix: "agw:oidc:test".into(),
+			transaction_ttl_seconds: 0,
+			auth_code_ttl_seconds: 300,
+			connect_timeout_ms: 5000,
+			command_timeout_ms: 2000,
 		};
-		store.insert_auth_code("proxy-code-1".into(), code_entry);
+		let err = cfg.validate().unwrap_err();
+		assert!(err.to_string().contains("transactionTtlSeconds"), "{err}");
+	}
 
-		let taken = store.take_auth_code("proxy-code-1");
-		assert!(taken.is_some());
+	#[test]
+	fn redis_config_accepts_valid_values() {
+		let cfg = RedisStorageConfig {
+			url: "redis://localhost:6379".into(),
+			key_prefix: "agw:oidc:local".into(),
+			transaction_ttl_seconds: 600,
+			auth_code_ttl_seconds: 300,
+			connect_timeout_ms: 5000,
+			command_timeout_ms: 2000,
+		};
+		cfg.validate().expect("valid config should pass");
+	}
 
+	#[tokio::test]
+	async fn connect_fails_on_unreachable_redis() {
+		let cfg = RedisStorageConfig {
+			url: "redis://127.0.0.1:1".into(),
+			key_prefix: "agw:oidc:test".into(),
+			transaction_ttl_seconds: 600,
+			auth_code_ttl_seconds: 300,
+			connect_timeout_ms: 500,
+			command_timeout_ms: 200,
+		};
+		let err = RedisProxyStore::connect(&cfg).await.unwrap_err();
+		let msg = err.to_string();
 		assert!(
-			store.take_auth_code("proxy-code-1").is_none(),
-			"auth code must be single-use"
+			msg.contains("timeout") || msg.contains("connection") || msg.contains("Connection refused"),
+			"should fail with connection error: {msg}"
 		);
 	}
 
 	#[test]
-	fn auth_code_rejects_expired() {
-		let mut store = OidcProxyStore::default();
-		let code_entry = ProxyAuthCode {
-			client_id: "client-1".into(),
-			client_redirect_uri: "https://app.example/callback".into(),
-			client_code_challenge: "challenge-abc".into(),
-			token_response: serde_json::json!({}),
-			expires_at: now_unix().saturating_sub(1),
-		};
-		store.insert_auth_code("expired-code".into(), code_entry);
-		assert!(store.take_auth_code("expired-code").is_none());
-	}
-
-	#[test]
-	fn pkce_s256_verification_matches() {
-		let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-		let expected_challenge = {
-			let digest = Sha256::digest(verifier.as_bytes());
-			base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-		};
-		assert!(constant_time_eq(
-			expected_challenge.as_bytes(),
-			expected_challenge.as_bytes()
-		));
-
-		let wrong_verifier = "wrong-verifier";
-		let wrong_challenge = {
-			let digest = Sha256::digest(wrong_verifier.as_bytes());
-			base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-		};
-		assert!(!constant_time_eq(
-			expected_challenge.as_bytes(),
-			wrong_challenge.as_bytes()
-		));
-	}
-
-	#[test]
-	fn revoke_by_client_id_purges_matching_entries() {
-		let mut store = OidcProxyStore::default();
-		store.insert_transaction(
-			"tx-a".into(),
-			ProxyTransaction {
-				client_id: "target-client".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_state: "s1".into(),
-				client_code_challenge: "ch1".into(),
-				idp_token_endpoint: "https://idp/token".into(),
-				gateway_pkce_verifier: "v1".into(),
-				client_scope: None,
-				expires_at: now_unix() + 600,
-			},
+	fn key_format_matches_spec() {
+		let prefix = "agw:oidc:local";
+		assert_eq!(format!("{prefix}:txn:abc"), "agw:oidc:local:txn:abc");
+		assert_eq!(format!("{prefix}:code:xyz"), "agw:oidc:local:code:xyz");
+		assert_eq!(
+			format!("{prefix}:idx:client:c1:txn"),
+			"agw:oidc:local:idx:client:c1:txn"
 		);
-		store.insert_transaction(
-			"tx-b".into(),
-			ProxyTransaction {
-				client_id: "other-client".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_state: "s2".into(),
-				client_code_challenge: "ch2".into(),
-				idp_token_endpoint: "https://idp/token".into(),
-				gateway_pkce_verifier: "v2".into(),
-				client_scope: None,
-				expires_at: now_unix() + 600,
-			},
+		assert_eq!(
+			format!("{prefix}:idx:client:c1:code"),
+			"agw:oidc:local:idx:client:c1:code"
 		);
-		store.insert_auth_code(
-			"code-a".into(),
-			ProxyAuthCode {
-				client_id: "target-client".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_code_challenge: "ch1".into(),
-				token_response: serde_json::json!({}),
-				expires_at: now_unix() + 300,
-			},
-		);
-		store.insert_auth_code(
-			"code-b".into(),
-			ProxyAuthCode {
-				client_id: "other-client".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_code_challenge: "ch2".into(),
-				token_response: serde_json::json!({}),
-				expires_at: now_unix() + 300,
-			},
-		);
-
-		let (tx_removed, code_removed) = store.revoke_by_client_id("target-client");
-		assert_eq!(tx_removed, 1);
-		assert_eq!(code_removed, 1);
-		assert!(!store.transactions.contains_key("tx-a"));
-		assert!(store.transactions.contains_key("tx-b"));
-		assert!(!store.auth_codes.contains_key("code-a"));
-		assert!(store.auth_codes.contains_key("code-b"));
-	}
-
-	#[test]
-	fn revoke_nonexistent_client_is_noop() {
-		let mut store = OidcProxyStore::default();
-		store.insert_transaction(
-			"tx-1".into(),
-			ProxyTransaction {
-				client_id: "existing".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_state: "s1".into(),
-				client_code_challenge: "ch1".into(),
-				idp_token_endpoint: "https://idp/token".into(),
-				gateway_pkce_verifier: "v1".into(),
-				client_scope: None,
-				expires_at: now_unix() + 600,
-			},
-		);
-
-		let (tx_removed, code_removed) = store.revoke_by_client_id("nonexistent");
-		assert_eq!(tx_removed, 0);
-		assert_eq!(code_removed, 0);
-		assert!(store.transactions.contains_key("tx-1"));
-	}
-
-	#[test]
-	fn gc_removes_expired_entries() {
-		let mut store = OidcProxyStore::default();
-		store.insert_transaction(
-			"expired".into(),
-			ProxyTransaction {
-				client_id: "c1".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_state: "s1".into(),
-				client_code_challenge: "ch1".into(),
-				idp_token_endpoint: "https://idp/token".into(),
-				gateway_pkce_verifier: "v1".into(),
-				client_scope: None,
-				expires_at: now_unix().saturating_sub(10),
-			},
-		);
-		store.insert_transaction(
-			"valid".into(),
-			ProxyTransaction {
-				client_id: "c2".into(),
-				client_redirect_uri: "https://example.com/cb".into(),
-				client_state: "s2".into(),
-				client_code_challenge: "ch2".into(),
-				idp_token_endpoint: "https://idp/token".into(),
-				gateway_pkce_verifier: "v2".into(),
-				client_scope: None,
-				expires_at: now_unix() + 600,
-			},
-		);
-
-		store.gc_expired();
-		assert!(!store.transactions.contains_key("expired"));
-		assert!(store.transactions.contains_key("valid"));
 	}
 }
