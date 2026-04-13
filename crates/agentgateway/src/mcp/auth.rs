@@ -22,8 +22,10 @@ use crate::types::agent::{McpAuthentication, McpIDP};
 static LOCAL_CLIENT_REGISTRY: Lazy<RwLock<LocalClientRegistry>> =
 	Lazy::new(|| RwLock::new(LocalClientRegistry::default()));
 
+/// RFC 7591 Dynamic Client Registration request.
+/// All standard metadata fields are accepted. Unknown extension fields are
+/// captured in `extensions` so they never cause deserialization failures.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
 struct LocalClientRegistrationRequest {
 	redirect_uris: Vec<String>,
 	#[serde(default)]
@@ -36,6 +38,26 @@ struct LocalClientRegistrationRequest {
 	response_types: Option<Vec<String>>,
 	#[serde(default)]
 	scope: Option<String>,
+	#[serde(default)]
+	client_uri: Option<String>,
+	#[serde(default)]
+	logo_uri: Option<String>,
+	#[serde(default)]
+	contacts: Option<Vec<String>>,
+	#[serde(default)]
+	tos_uri: Option<String>,
+	#[serde(default)]
+	policy_uri: Option<String>,
+	#[serde(default)]
+	jwks_uri: Option<String>,
+	#[serde(default)]
+	jwks: Option<serde_json::Value>,
+	#[serde(default)]
+	software_id: Option<String>,
+	#[serde(default)]
+	software_version: Option<String>,
+	#[serde(flatten)]
+	extensions: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -49,6 +71,22 @@ pub(super) struct LocalClientRegistrationRecord {
 	grant_types: Vec<String>,
 	response_types: Vec<String>,
 	scope: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	client_uri: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	logo_uri: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	contacts: Option<Vec<String>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	tos_uri: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	policy_uri: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	jwks_uri: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	software_id: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	software_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -173,6 +211,14 @@ impl LocalClientRegistry {
 				.unwrap_or_else(|| vec!["authorization_code".into()]),
 			response_types: request.response_types.unwrap_or_else(|| vec!["code".into()]),
 			scope: request.scope,
+			client_uri: request.client_uri,
+			logo_uri: request.logo_uri,
+			contacts: request.contacts,
+			tos_uri: request.tos_uri,
+			policy_uri: request.policy_uri,
+			jwks_uri: request.jwks_uri,
+			software_id: request.software_id,
+			software_version: request.software_version,
 		};
 		self.by_id.insert(client_id, record.clone());
 		Ok((record, true))
@@ -205,6 +251,14 @@ impl LocalClientRegistry {
 			.unwrap_or_else(|| vec!["authorization_code".into()]);
 		existing.response_types = normalized.response_types.unwrap_or_else(|| vec!["code".into()]);
 		existing.scope = normalized.scope;
+		existing.client_uri = normalized.client_uri;
+		existing.logo_uri = normalized.logo_uri;
+		existing.contacts = normalized.contacts;
+		existing.tos_uri = normalized.tos_uri;
+		existing.policy_uri = normalized.policy_uri;
+		existing.jwks_uri = normalized.jwks_uri;
+		existing.software_id = normalized.software_id;
+		existing.software_version = normalized.software_version;
 		Ok(existing.clone())
 	}
 
@@ -657,16 +711,34 @@ pub(super) async fn client_registration(
 
 	match method {
 		Method::POST => {
-			let request: LocalClientRegistrationRequest = serde_json::from_value(body).map_err(|e| {
-				ProxyError::ProcessingString(format!(
-					"invalid client registration metadata payload: {e}"
-				))
-			})?;
-		let (record, created) = LOCAL_CLIENT_REGISTRY
+			let request: LocalClientRegistrationRequest = match serde_json::from_value(body) {
+				Ok(r) => r,
+				Err(e) => {
+					return build_json_response(
+						StatusCode::BAD_REQUEST,
+						serde_json::json!({
+							"error": "invalid_client_metadata",
+							"error_description": format!("invalid registration payload: {e}")
+						}),
+					);
+				},
+			};
+		let (record, created) = match LOCAL_CLIENT_REGISTRY
 			.write()
-			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-			.register(&auth.issuer, request)
-			.map_err(ProxyError::ProcessingString)?;
+			.map_err(|_| "local registry lock poisoned".to_string())
+			.and_then(|mut reg| reg.register(&auth.issuer, request))
+		{
+			Ok(result) => result,
+			Err(e) => {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({
+						"error": "invalid_client_metadata",
+						"error_description": e
+					}),
+				);
+			},
+		};
 		let status = if created {
 			info!(
 				client_id = %record.client_id,
@@ -715,16 +787,34 @@ pub(super) async fn client_registration(
 					serde_json::json!({ "error": "client_id path segment is required for update" }),
 				);
 			}
-			let request: LocalClientRegistrationRequest = serde_json::from_value(body).map_err(|e| {
-				ProxyError::ProcessingString(format!(
-					"invalid client registration metadata payload: {e}"
-				))
-			})?;
-		let updated = LOCAL_CLIENT_REGISTRY
+		let request: LocalClientRegistrationRequest = match serde_json::from_value(body) {
+			Ok(r) => r,
+			Err(e) => {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({
+						"error": "invalid_client_metadata",
+						"error_description": format!("invalid registration payload: {e}")
+					}),
+				);
+			},
+		};
+		let updated = match LOCAL_CLIENT_REGISTRY
 			.write()
-			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-			.update(client_id, request)
-			.map_err(ProxyError::ProcessingString)?;
+			.map_err(|_| "local registry lock poisoned".to_string())
+			.and_then(|mut reg| reg.update(client_id, request))
+		{
+			Ok(result) => result,
+			Err(e) => {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({
+						"error": "invalid_client_metadata",
+						"error_description": e
+					}),
+				);
+			},
+		};
 		info!(
 			client_id = %updated.client_id,
 			audit_event = "client_updated",
@@ -790,14 +880,15 @@ mod tests {
 	use super::*;
 
 	fn sample_request() -> LocalClientRegistrationRequest {
-		LocalClientRegistrationRequest {
-			redirect_uris: vec!["https://app.example/callback".into()],
-			client_name: Some("my app".into()),
-			token_endpoint_auth_method: Some("client_secret_basic".into()),
-			grant_types: Some(vec!["authorization_code".into()]),
-			response_types: Some(vec!["code".into()]),
-			scope: Some("openid profile".into()),
-		}
+		serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/callback"],
+			"client_name": "my app",
+			"token_endpoint_auth_method": "client_secret_basic",
+			"grant_types": ["authorization_code"],
+			"response_types": ["code"],
+			"scope": "openid profile"
+		}))
+		.expect("sample request")
 	}
 
 	#[test]
@@ -817,18 +908,17 @@ mod tests {
 		let issuer = "https://issuer.example";
 		let (record, _) = registry.register(issuer, sample_request()).expect("register");
 
+		let update_request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://updated.example/callback"],
+			"client_name": "updated",
+			"token_endpoint_auth_method": "client_secret_post",
+			"grant_types": ["authorization_code", "refresh_token"],
+			"response_types": ["code"],
+			"scope": "openid email"
+		}))
+		.expect("parse update");
 		let updated = registry
-			.update(
-				&record.client_id,
-				LocalClientRegistrationRequest {
-					redirect_uris: vec!["https://updated.example/callback".into()],
-					client_name: Some("updated".into()),
-					token_endpoint_auth_method: Some("client_secret_post".into()),
-					grant_types: Some(vec!["authorization_code".into(), "refresh_token".into()]),
-					response_types: Some(vec!["code".into()]),
-					scope: Some("openid email".into()),
-				},
-			)
+			.update(&record.client_id, update_request)
 			.expect("update");
 		assert_eq!(updated.client_name.as_deref(), Some("updated"));
 		assert_eq!(updated.token_endpoint_auth_method, "client_secret_post");
@@ -859,18 +949,15 @@ mod tests {
 	#[test]
 	fn malformed_or_unsupported_metadata_is_rejected() {
 		let mut registry = LocalClientRegistry::default();
+		let request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["not-a-uri"],
+			"token_endpoint_auth_method": "private_key_jwt",
+			"grant_types": ["client_credentials"],
+			"response_types": ["token"]
+		}))
+		.expect("parse");
 		let err = registry
-			.register(
-				"https://issuer.example",
-				LocalClientRegistrationRequest {
-					redirect_uris: vec!["not-a-uri".into()],
-					client_name: None,
-					token_endpoint_auth_method: Some("private_key_jwt".into()),
-					grant_types: Some(vec!["client_credentials".into()]),
-					response_types: Some(vec!["token".into()]),
-					scope: None,
-				},
-			)
+			.register("https://issuer.example", request)
 			.expect_err("invalid metadata should fail");
 		assert!(err.contains("redirect_uris") || err.contains("token_endpoint_auth_method"));
 	}
@@ -998,5 +1085,82 @@ mod tests {
 				"path should NOT be exempt from JWT: {path}"
 			);
 		}
+	}
+
+	#[test]
+	fn rfc7591_full_metadata_payload_parses_successfully() {
+		let payload = serde_json::json!({
+			"redirect_uris": ["https://app.example/callback"],
+			"token_endpoint_auth_method": "none",
+			"grant_types": ["authorization_code"],
+			"response_types": ["code"],
+			"client_name": "rfc7591-full-smoke",
+			"client_uri": "https://example.com",
+			"logo_uri": "https://example.com/logo.png",
+			"scope": "openid profile",
+			"contacts": ["dev@example.com"],
+			"tos_uri": "https://example.com/tos",
+			"policy_uri": "https://example.com/policy",
+			"jwks_uri": "https://example.com/jwks.json",
+			"software_id": "example-software-id",
+			"software_version": "1.0.0"
+		});
+		let request: LocalClientRegistrationRequest =
+			serde_json::from_value(payload).expect("RFC 7591 full payload must parse");
+		let normalized = request.validate_and_normalize().expect("must validate");
+		assert_eq!(normalized.logo_uri.as_deref(), Some("https://example.com/logo.png"));
+		assert_eq!(normalized.software_id.as_deref(), Some("example-software-id"));
+		assert_eq!(normalized.contacts.as_ref().map(|c| c.len()), Some(1));
+	}
+
+	#[test]
+	fn rfc7591_registration_stores_and_returns_metadata() {
+		let mut registry = LocalClientRegistry::default();
+		let request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/callback"],
+			"client_name": "with-metadata",
+			"logo_uri": "https://example.com/logo.png",
+			"client_uri": "https://example.com",
+			"tos_uri": "https://example.com/tos",
+			"policy_uri": "https://example.com/policy",
+			"software_id": "sw-1",
+			"software_version": "2.0.0",
+			"contacts": ["a@b.com", "c@d.com"]
+		}))
+		.expect("parse");
+		let (record, created) = registry.register("https://issuer.example", request).expect("register");
+		assert!(created);
+		assert_eq!(record.logo_uri.as_deref(), Some("https://example.com/logo.png"));
+		assert_eq!(record.software_version.as_deref(), Some("2.0.0"));
+		assert_eq!(record.contacts.as_ref().map(|c| c.len()), Some(2));
+
+		let json = serde_json::to_value(&record).expect("serialize");
+		assert!(json.get("logo_uri").is_some(), "logo_uri in response");
+		assert!(json.get("software_id").is_some(), "software_id in response");
+	}
+
+	#[test]
+	fn unknown_extension_fields_do_not_crash() {
+		let payload = serde_json::json!({
+			"redirect_uris": ["https://app.example/callback"],
+			"completely_unknown_field": "some value",
+			"another_vendor_ext": 42,
+			"x-custom": {"nested": true}
+		});
+		let request: LocalClientRegistrationRequest =
+			serde_json::from_value(payload).expect("unknown fields must not crash");
+		let normalized = request.validate_and_normalize().expect("must validate");
+		assert_eq!(normalized.redirect_uris.len(), 1);
+		assert!(normalized.extensions.contains_key("completely_unknown_field"));
+	}
+
+	#[test]
+	fn invalid_metadata_returns_descriptive_error() {
+		let request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": []
+		}))
+		.expect("parse");
+		let err = request.validate_and_normalize().unwrap_err();
+		assert!(err.contains("redirect_uris"), "error mentions the invalid field: {err}");
 	}
 }
