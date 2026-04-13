@@ -16,8 +16,10 @@ use crate::mcp::auth;
 use crate::mcp::oidc_proxy;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::test_helpers::proxymock::setup_proxy_test;
+use crate::mcp::oidc_proxy::RedisProxyStore;
 use crate::types::agent::{
-	McpAuthentication, McpAuthenticationMode, McpIDP, OidcProxyConfig, ResourceMetadata,
+	McpAuthentication, McpAuthenticationMode, McpIDP, OidcProxyConfig, RedisStorageConfig,
+	ResourceMetadata,
 };
 
 const TEST_JWKS_JSON: &str = r#"{
@@ -35,7 +37,73 @@ fn policy_client() -> PolicyClient {
 	}
 }
 
-fn test_mcp_auth(idp_issuer: &str, proxy_client_id: &str) -> McpAuthentication {
+fn redis_url() -> Option<String> {
+	std::env::var("REDIS_URL").ok().filter(|s| !s.is_empty())
+}
+
+fn skip_without_redis() -> bool {
+	if redis_url().is_none() {
+		eprintln!("REDIS_URL not set; skipping Redis-dependent test");
+		true
+	} else {
+		false
+	}
+}
+
+async fn test_redis_store(prefix: &str) -> Arc<RedisProxyStore> {
+	let cfg = RedisStorageConfig {
+		url: redis_url().expect("REDIS_URL required"),
+		key_prefix: format!("agw:oidc:test:{prefix}"),
+		transaction_ttl_seconds: 60,
+		auth_code_ttl_seconds: 30,
+		connect_timeout_ms: 5000,
+		command_timeout_ms: 2000,
+	};
+	Arc::new(RedisProxyStore::connect(&cfg).await.expect("redis connect"))
+}
+
+async fn test_mcp_auth(idp_issuer: &str, proxy_client_id: &str) -> McpAuthentication {
+	let jwks: jsonwebtoken::jwk::JwkSet =
+		serde_json::from_str(TEST_JWKS_JSON).expect("test jwks");
+	let provider = jwt::Provider::from_jwks(
+		jwks,
+		idp_issuer.to_string(),
+		Some(vec!["test-aud".into()]),
+		jwt::JWTValidationOptions::default(),
+	)
+	.expect("jwt provider");
+	let validator = jwt::Jwt::from_providers(vec![provider], jwt::Mode::Strict);
+
+	let store = test_redis_store(proxy_client_id).await;
+
+	McpAuthentication {
+		issuer: idp_issuer.to_string(),
+		audiences: vec!["test-aud".into()],
+		provider: None,
+		resource_metadata: ResourceMetadata {
+			extra: BTreeMap::new(),
+		},
+		jwt_validator: Arc::new(validator),
+		mode: McpAuthenticationMode::Strict,
+		oidc_proxy: Some(OidcProxyConfig {
+			client_id: proxy_client_id.to_string(),
+			client_secret: secrecy::SecretString::new("gateway-secret".into()),
+			store,
+		}),
+	}
+}
+
+async fn test_mcp_auth_with_provider(
+	idp_issuer: &str,
+	proxy_client_id: &str,
+	provider: Option<McpIDP>,
+) -> McpAuthentication {
+	let mut auth = test_mcp_auth(idp_issuer, proxy_client_id).await;
+	auth.provider = provider;
+	auth
+}
+
+fn test_mcp_auth_no_proxy(idp_issuer: &str) -> McpAuthentication {
 	let jwks: jsonwebtoken::jwk::JwkSet =
 		serde_json::from_str(TEST_JWKS_JSON).expect("test jwks");
 	let provider = jwt::Provider::from_jwks(
@@ -56,21 +124,8 @@ fn test_mcp_auth(idp_issuer: &str, proxy_client_id: &str) -> McpAuthentication {
 		},
 		jwt_validator: Arc::new(validator),
 		mode: McpAuthenticationMode::Strict,
-		oidc_proxy: Some(OidcProxyConfig {
-			client_id: proxy_client_id.to_string(),
-			client_secret: secrecy::SecretString::new("gateway-secret".into()),
-		}),
+		oidc_proxy: None,
 	}
-}
-
-fn test_mcp_auth_with_provider(
-	idp_issuer: &str,
-	proxy_client_id: &str,
-	provider: Option<McpIDP>,
-) -> McpAuthentication {
-	let mut auth = test_mcp_auth(idp_issuer, proxy_client_id);
-	auth.provider = provider;
-	auth
 }
 
 fn registration_body() -> serde_json::Value {
@@ -166,7 +221,8 @@ async fn e2e_register_authorize_callback_token() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-client");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-client").await;
 	let client = policy_client();
 
 	// 1. Register a client
@@ -251,7 +307,8 @@ async fn e2e_register_authorize_callback_token() {
 
 #[tokio::test]
 async fn registration_idempotency_returns_same_client() {
-	let auth = test_mcp_auth("https://idempotent.example", "gw");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth("https://idempotent.example", "gw").await;
 	let client = policy_client();
 
 	let mut req1 = build_request(
@@ -305,7 +362,8 @@ async fn token_rejects_wrong_pkce_verifier() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-pkce");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-pkce").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -398,7 +456,8 @@ async fn proxy_code_is_single_use() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-replay");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-replay").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -482,7 +541,8 @@ async fn deactivated_client_blocks_authorize_and_token() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-deact");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-deact").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -557,7 +617,8 @@ async fn authorize_rejects_unregistered_redirect_uri() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-redir");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-redir").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -618,7 +679,8 @@ async fn callback_state_is_single_use() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-state-replay");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-state-replay").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -686,7 +748,8 @@ async fn token_rejects_wrong_client_secret() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth(&idp_uri, "gw-badsecret");
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth(&idp_uri, "gw-badsecret").await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -770,7 +833,8 @@ async fn okta_provider_uses_rfc8414_metadata_and_audience_prepend() {
 		.mount(&idp)
 		.await;
 
-	let auth = test_mcp_auth_with_provider(&idp_uri, "gw-okta", Some(McpIDP::Okta {}));
+	if skip_without_redis() { return; }
+	let auth = test_mcp_auth_with_provider(&idp_uri, "gw-okta", Some(McpIDP::Okta {})).await;
 	let client = policy_client();
 
 	let mut reg = build_request(
@@ -855,9 +919,9 @@ async fn okta_as_metadata_prepends_audience_to_authorization_endpoint() {
 		.mount(&idp)
 		.await;
 
-	let mut auth = test_mcp_auth_with_provider(&idp_uri, "gw-okta-aud", Some(McpIDP::Okta {}));
+	let mut auth = test_mcp_auth_no_proxy(&idp_uri);
+	auth.provider = Some(McpIDP::Okta {});
 	auth.audiences = vec!["urn:okta:audience".into()];
-	auth.oidc_proxy = None;
 	let client = policy_client();
 
 	let mut req = build_request(
@@ -1052,7 +1116,14 @@ fn okta_config_rejects_empty_proxy_client_id() {
 		"jwks": { "url": "https://dev-xxx.okta.com/oauth2/default/v1/keys" },
 		"oidcProxy": {
 			"clientId": "",
-			"clientSecret": "some-secret"
+			"clientSecret": "some-secret",
+			"storage": {
+				"provider": "redis",
+				"redis": {
+					"url": "redis://localhost:6379",
+					"keyPrefix": "agw:oidc:test"
+				}
+			}
 		}
 	}))
 	.expect("deserialize");

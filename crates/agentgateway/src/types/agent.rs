@@ -2193,6 +2193,8 @@ pub struct OidcProxyConfig {
 	pub client_id: String,
 	#[serde(serialize_with = "crate::serdes::ser_redact")]
 	pub client_secret: secrecy::SecretString,
+	#[serde(skip)]
+	pub store: Arc<crate::mcp::oidc_proxy::RedisProxyStore>,
 }
 
 #[apply(schema_enum!)]
@@ -2244,6 +2246,74 @@ pub struct LocalOidcProxyConfig {
 	pub client_id: String,
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
 	pub client_secret: secrecy::SecretString,
+	pub storage: OidcProxyStorageConfig,
+}
+
+/// Storage backend for OIDC proxy state (transactions and auth codes).
+#[apply(schema_de!)]
+pub struct OidcProxyStorageConfig {
+	pub provider: OidcProxyStorageProvider,
+	pub redis: RedisStorageConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum OidcProxyStorageProvider {
+	Redis,
+}
+
+/// Redis connection and key configuration for OIDC proxy state.
+#[apply(schema_de!)]
+pub struct RedisStorageConfig {
+	pub url: String,
+	#[serde(default = "RedisStorageConfig::default_key_prefix")]
+	pub key_prefix: String,
+	#[serde(default = "RedisStorageConfig::default_transaction_ttl_seconds")]
+	pub transaction_ttl_seconds: u64,
+	#[serde(default = "RedisStorageConfig::default_auth_code_ttl_seconds")]
+	pub auth_code_ttl_seconds: u64,
+	#[serde(default = "RedisStorageConfig::default_connect_timeout_ms")]
+	pub connect_timeout_ms: u64,
+	#[serde(default = "RedisStorageConfig::default_command_timeout_ms")]
+	pub command_timeout_ms: u64,
+}
+
+impl RedisStorageConfig {
+	fn default_key_prefix() -> String {
+		"agw:oidc:local".into()
+	}
+	fn default_transaction_ttl_seconds() -> u64 {
+		600
+	}
+	fn default_auth_code_ttl_seconds() -> u64 {
+		300
+	}
+	fn default_connect_timeout_ms() -> u64 {
+		5000
+	}
+	fn default_command_timeout_ms() -> u64 {
+		2000
+	}
+
+	pub fn validate(&self) -> anyhow::Result<()> {
+		if self.url.is_empty() {
+			anyhow::bail!(
+				"oidcProxy.storage.redis.url must not be empty; \
+				 set REDIS_URL or configure url in config file"
+			);
+		}
+		if self.key_prefix.is_empty() {
+			anyhow::bail!("oidcProxy.storage.redis.keyPrefix must not be empty");
+		}
+		if self.transaction_ttl_seconds == 0 {
+			anyhow::bail!("oidcProxy.storage.redis.transactionTtlSeconds must be > 0");
+		}
+		if self.auth_code_ttl_seconds == 0 {
+			anyhow::bail!("oidcProxy.storage.redis.authCodeTtlSeconds must be > 0");
+		}
+		Ok(())
+	}
 }
 
 impl LocalMcpAuthentication {
@@ -2315,10 +2385,18 @@ impl LocalMcpAuthentication {
 		self.validate_provider_config()?;
 		let jwt_cfg = self.as_jwt()?;
 		let jwt = jwt_cfg.try_into(client).await?;
-		let oidc_proxy = self.oidc_proxy.as_ref().map(|p| OidcProxyConfig {
-			client_id: p.client_id.clone(),
-			client_secret: p.client_secret.clone(),
-		});
+		let oidc_proxy = match &self.oidc_proxy {
+			Some(p) => {
+				p.storage.redis.validate()?;
+				let store = crate::mcp::oidc_proxy::RedisProxyStore::connect(&p.storage.redis).await?;
+				Some(OidcProxyConfig {
+					client_id: p.client_id.clone(),
+					client_secret: p.client_secret.clone(),
+					store: Arc::new(store),
+				})
+			},
+			None => None,
+		};
 		Ok(McpAuthentication {
 			issuer: self.issuer.clone(),
 			audiences: self.audiences.clone(),
