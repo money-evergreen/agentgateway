@@ -1,6 +1,7 @@
 pub(crate) mod auth;
 mod handler;
 mod mergestream;
+pub(crate) mod oidc_proxy;
 mod rbac;
 mod router;
 mod session;
