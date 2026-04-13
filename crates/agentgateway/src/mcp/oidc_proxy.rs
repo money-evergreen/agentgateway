@@ -594,48 +594,8 @@ pub(super) async fn proxy_token(
 		.map_err(ProxyError::Http)
 }
 
-pub(super) fn rewrite_as_metadata(
-	resp: &mut serde_json::Value,
-	req: &Request,
-	auth: &McpAuthentication,
-) {
-	if auth.oidc_proxy.is_none() {
-		return;
-	}
-
-	let base_url = derive_as_base_url(req);
-
-	if let Some(obj) = resp.as_object_mut() {
-		obj.insert(
-			"authorization_endpoint".into(),
-			serde_json::Value::String(format!("{base_url}/authorize")),
-		);
-		obj.insert(
-			"token_endpoint".into(),
-			serde_json::Value::String(format!("{base_url}/token")),
-		);
-		obj.insert(
-			"registration_endpoint".into(),
-			serde_json::Value::String(format!("{base_url}/client-registration")),
-		);
-		obj.insert(
-			"code_challenge_methods_supported".into(),
-			serde_json::json!(["S256"]),
-		);
-		obj.insert(
-			"grant_types_supported".into(),
-			serde_json::json!(["authorization_code"]),
-		);
-		obj.insert(
-			"response_types_supported".into(),
-			serde_json::json!(["code"]),
-		);
-		obj.insert(
-			"token_endpoint_auth_methods_supported".into(),
-			serde_json::json!(["client_secret_basic", "client_secret_post"]),
-		);
-	}
-}
+// rewrite_as_metadata is no longer needed — gateway AS metadata is built from scratch
+// in build_gateway_as_metadata when oidc_proxy is configured.
 
 async fn fetch_idp_metadata(
 	auth: &McpAuthentication,
@@ -783,30 +743,19 @@ fn extract_client_credentials(
 }
 
 fn derive_callback_url(req: &Request) -> String {
+	let base_url = super::auth::derive_public_base_url(req);
 	let uri = req
 		.extensions()
 		.get::<crate::http::filters::OriginalUrl>()
 		.map(|u| u.0.clone())
 		.unwrap_or_else(|| req.uri().clone());
-
 	let path = uri.path();
-	let base = path
+	let parent = path
 		.rsplit_once('/')
 		.map(|(prefix, _)| prefix)
 		.unwrap_or(path);
 
-	let full = uri.to_string();
-	full.replace(path, &format!("{base}/callback"))
-}
-
-fn derive_as_base_url(req: &Request) -> String {
-	let uri = req
-		.extensions()
-		.get::<crate::http::filters::OriginalUrl>()
-		.map(|u| u.0.clone())
-		.unwrap_or_else(|| req.uri().clone());
-
-	uri.to_string()
+	base_url.replace(path, &format!("{parent}/callback"))
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
