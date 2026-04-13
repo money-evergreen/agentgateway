@@ -233,12 +233,26 @@ pub(crate) fn is_well_known_endpoint(path: &str) -> bool {
 		|| path.starts_with("/.well-known/oauth-authorization-server")
 }
 
+/// Returns true for paths that are part of the OAuth bootstrap flow and must be
+/// accessible without a pre-existing bearer JWT. This includes well-known discovery
+/// endpoints AND OAuth flow entry points (registration, authorize, callback, token)
+/// regardless of where they are mounted in the route tree.
+pub(crate) fn is_oauth_bootstrap_path(path: &str) -> bool {
+	if is_well_known_endpoint(path) {
+		return true;
+	}
+	let segment = path.rsplit('/').next().unwrap_or("");
+	matches!(
+		segment,
+		"client-registration" | "authorize" | "callback" | "token"
+	)
+}
+
 pub(super) async fn apply_token_validation(
 	req: &mut Request,
 	auth: &McpAuthentication,
 ) -> Result<(), ProxyError> {
-	// skip well-known OAuth endpoints for authn
-	if is_well_known_endpoint(req.uri().path()) {
+	if is_oauth_bootstrap_path(req.uri().path()) {
 		return Ok(());
 	}
 	let has_claims = req.extensions().get::<Claims>().is_some();
@@ -267,8 +281,7 @@ pub(crate) async fn enforce_authentication(
 	auth: &McpAuthentication,
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
-	// skip well-known OAuth endpoints for authn
-	if !is_well_known_endpoint(req.uri().path()) {
+	if !is_oauth_bootstrap_path(req.uri().path()) {
 		apply_token_validation(req, auth).await?;
 	}
 
@@ -282,9 +295,10 @@ pub(crate) async fn handle_mcp_request(
 ) -> Result<Option<Response>, ProxyError> {
 	let _ = client;
 	let path = req.uri().path().to_string();
+	let tail = path.rsplit('/').next().unwrap_or("");
+
 	match path.as_str() {
-		// TODO: indicate this is a DirectResponse
-		p if p.contains("/client-registration") => Ok(Some(
+		p if p.contains("/client-registration") || tail == "client-registration" => Ok(Some(
 			client_registration(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -296,7 +310,8 @@ pub(crate) async fn handle_mcp_request(
 		p if p.starts_with("/.well-known/oauth-protected-resource") => Ok(Some(
 			protected_resource_metadata(req, auth).await.into_response(),
 		)),
-		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/authorize") =>
+		p if (p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/authorize"))
+			|| tail == "authorize" =>
 		{
 			Ok(Some(
 				super::oidc_proxy::proxy_authorize(req, auth, client.clone())
@@ -308,7 +323,8 @@ pub(crate) async fn handle_mcp_request(
 					.into_response(),
 			))
 		},
-		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/callback") =>
+		p if (p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/callback"))
+			|| tail == "callback" =>
 		{
 			Ok(Some(
 				super::oidc_proxy::proxy_callback(req, auth, client.clone())
@@ -320,7 +336,9 @@ pub(crate) async fn handle_mcp_request(
 					.into_response(),
 			))
 		},
-		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/token") => {
+		p if (p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/token"))
+			|| tail == "token" =>
+		{
 			Ok(Some(
 				super::oidc_proxy::proxy_token(req, auth, client.clone())
 					.await
@@ -341,7 +359,7 @@ pub(crate) async fn handle_mcp_request(
 				.into_response(),
 		)),
 		_ => {
-			// Not handled
+			// Not handled by OAuth/MCP auth layer
 			Ok(None)
 		},
 	}
@@ -465,16 +483,19 @@ pub(super) async fn authorization_server_metadata(
 	match &auth.provider {
 		Some(McpIDP::Auth0 {}) | Some(McpIDP::Okta {}) => {
 			// Auth0 and Okta do not support RFC 8707 resource indicators.
-			// Workaround: prepend the audience as a query parameter on the authorization endpoint.
-			let Some(serde_json::Value::String(ae)) =
+			// When the IDP metadata contains authorization_endpoint, prepend the audience.
+			// When oidcProxy is configured, rewrite_as_metadata will replace these endpoints
+			// with gateway-proxied URLs, so a missing field from the IDP is not fatal.
+			if let Some(serde_json::Value::String(ae)) =
 				json::traverse_mut(&mut resp, &["authorization_endpoint"])
-			else {
+			{
+				if let Some(aud) = auth.audiences.first() {
+					ae.push_str(&format!("?audience={}", aud));
+				}
+			} else if auth.oidc_proxy.is_none() {
 				return Err(ProxyError::ProcessingString(
-					"authorization_endpoint missing".to_string(),
+					"authorization_endpoint missing from IDP metadata".to_string(),
 				));
-			};
-			if let Some(aud) = auth.audiences.first() {
-				ae.push_str(&format!("?audience={}", aud));
 			}
 		},
 		Some(McpIDP::Keycloak { .. }) => {
@@ -759,5 +780,47 @@ mod tests {
 			)
 			.expect_err("invalid metadata should fail");
 		assert!(err.contains("redirect_uris") || err.contains("token_endpoint_auth_method"));
+	}
+
+	#[test]
+	fn oauth_bootstrap_paths_are_exempt_from_jwt() {
+		let exempt = [
+			"/.well-known/oauth-authorization-server",
+			"/.well-known/oauth-authorization-server/authorize",
+			"/.well-known/oauth-authorization-server/token",
+			"/.well-known/oauth-authorization-server/callback",
+			"/.well-known/oauth-authorization-server/client-registration",
+			"/.well-known/oauth-protected-resource/mcp",
+			"/mcp/authorize",
+			"/mcp/token",
+			"/mcp/callback",
+			"/mcp/client-registration",
+			"/any/prefix/authorize",
+			"/any/prefix/token",
+			"/any/prefix/callback",
+		];
+		for path in exempt {
+			assert!(
+				is_oauth_bootstrap_path(path),
+				"path should be exempt from JWT: {path}"
+			);
+		}
+	}
+
+	#[test]
+	fn protected_mcp_paths_require_jwt() {
+		let protected = [
+			"/mcp",
+			"/mcp/v1",
+			"/some/tool/invoke",
+			"/api/resources",
+			"/health",
+		];
+		for path in protected {
+			assert!(
+				!is_oauth_bootstrap_path(path),
+				"path should NOT be exempt from JWT: {path}"
+			);
+		}
 	}
 }
