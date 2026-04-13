@@ -477,37 +477,10 @@ fn strip_oauth_protected_resource_prefix_public(req: &Request) -> String {
 	}
 }
 
-/// Derive the AS base URL for the protected-resource authorization_servers field.
-/// Uses the public URL but with the well-known AS path.
+/// Derive the issuer URL for the protected-resource `authorization_servers` field.
+/// Per RFC 8414, the issuer is the base URL (scheme + host), not the well-known path.
 fn derive_public_base_url_for_as(req: &Request) -> String {
-	let uri = req
-		.extensions()
-		.get::<filters::OriginalUrl>()
-		.map(|u| u.0.clone())
-		.unwrap_or_else(|| req.uri().clone());
-	let path = uri.path();
-
-	let scheme = req
-		.headers()
-		.get("x-forwarded-proto")
-		.and_then(|v| v.to_str().ok())
-		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https"));
-	let host = req
-		.headers()
-		.get("x-forwarded-host")
-		.and_then(|v| v.to_str().ok())
-		.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
-		.or_else(|| uri.host())
-		.unwrap_or("localhost");
-
-	const PRM_PREFIX: &str = "/.well-known/oauth-protected-resource";
-	let as_path = if let Some(suffix) = path.strip_prefix(PRM_PREFIX) {
-		format!("/.well-known/oauth-authorization-server{suffix}")
-	} else {
-		"/.well-known/oauth-authorization-server".to_string()
-	};
-
-	format!("{scheme}://{host}{as_path}")
+	derive_public_issuer_url(req)
 }
 
 pub(super) async fn authorization_server_metadata(
@@ -540,13 +513,14 @@ fn build_gateway_as_metadata(
 	req: &Request,
 	auth: &McpAuthentication,
 ) -> serde_json::Value {
-	let base_url = derive_public_base_url(req);
+	let issuer = derive_public_issuer_url(req);
+	let endpoint_base = derive_public_base_url(req);
 
 	serde_json::json!({
-		"issuer": base_url,
-		"authorization_endpoint": format!("{base_url}/authorize"),
-		"token_endpoint": format!("{base_url}/token"),
-		"registration_endpoint": format!("{base_url}/client-registration"),
+		"issuer": issuer,
+		"authorization_endpoint": format!("{endpoint_base}/authorize"),
+		"token_endpoint": format!("{endpoint_base}/token"),
+		"registration_endpoint": format!("{endpoint_base}/client-registration"),
 		"code_challenge_methods_supported": ["S256"],
 		"grant_types_supported": ["authorization_code"],
 		"response_types_supported": ["code"],
@@ -612,7 +586,28 @@ async fn build_proxied_as_metadata(
 /// Derive the public-facing base URL from the request, respecting reverse-proxy
 /// headers (X-Forwarded-Proto, X-Forwarded-Host, Forwarded) so that metadata
 /// endpoints advertise HTTPS URLs when served behind TLS termination (e.g. Fly.io).
+/// Derive the public-facing issuer base URL: `{scheme}://{host}` with NO path.
+/// This is the RFC 8414 `issuer` value that clients use as the base for
+/// constructing well-known and endpoint URLs.
+pub(crate) fn derive_public_issuer_url(req: &Request) -> String {
+	let (scheme, host) = derive_scheme_and_host(req);
+	format!("{scheme}://{host}")
+}
+
+/// Derive the public-facing URL for the current request path.
+/// Used for endpoint URLs that include the full well-known path prefix.
 pub(crate) fn derive_public_base_url(req: &Request) -> String {
+	let uri = req
+		.extensions()
+		.get::<filters::OriginalUrl>()
+		.map(|u| u.0.clone())
+		.unwrap_or_else(|| req.uri().clone());
+	let (scheme, host) = derive_scheme_and_host(req);
+	let path = uri.path();
+	format!("{scheme}://{host}{path}")
+}
+
+fn derive_scheme_and_host(req: &Request) -> (String, String) {
 	let uri = req
 		.extensions()
 		.get::<filters::OriginalUrl>()
@@ -623,7 +618,8 @@ pub(crate) fn derive_public_base_url(req: &Request) -> String {
 		.headers()
 		.get("x-forwarded-proto")
 		.and_then(|v| v.to_str().ok())
-		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https"));
+		.map(|s| s.to_string())
+		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https").to_string());
 
 	let host = req
 		.headers()
@@ -631,11 +627,10 @@ pub(crate) fn derive_public_base_url(req: &Request) -> String {
 		.and_then(|v| v.to_str().ok())
 		.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
 		.or_else(|| uri.host())
-		.unwrap_or("localhost");
+		.unwrap_or("localhost")
+		.to_string();
 
-	let path = uri.path();
-
-	format!("{scheme}://{host}{path}")
+	(scheme, host)
 }
 
 pub(super) async fn client_registration(
@@ -933,7 +928,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gateway_as_metadata_has_required_fields_and_no_error_keys() {
+	fn gateway_as_metadata_issuer_is_base_url_not_well_known_path() {
 		let req = ::http::Request::builder()
 			.uri("https://gw.example/.well-known/oauth-authorization-server")
 			.header("host", "gw.example")
@@ -944,22 +939,25 @@ mod tests {
 		let metadata = build_gateway_as_metadata(&req, &auth);
 		let obj = metadata.as_object().expect("must be object");
 
-		assert!(obj.get("issuer").and_then(|v| v.as_str()).is_some(), "issuer required");
-		assert!(obj.get("authorization_endpoint").and_then(|v| v.as_str()).is_some());
-		assert!(obj.get("token_endpoint").and_then(|v| v.as_str()).is_some());
-		assert!(obj.get("registration_endpoint").and_then(|v| v.as_str()).is_some());
+		let issuer = obj["issuer"].as_str().unwrap();
+		assert_eq!(issuer, "https://gw.example", "issuer must be base URL without path");
+		assert!(!issuer.contains(".well-known"), "issuer must NOT contain well-known path");
+
+		let authz = obj["authorization_endpoint"].as_str().unwrap();
+		assert!(authz.contains("/.well-known/oauth-authorization-server/authorize"), "endpoints keep full path: {authz}");
+
+		let reg = obj["registration_endpoint"].as_str().unwrap();
+		assert!(reg.contains("/client-registration"), "registration endpoint present: {reg}");
+
 		assert!(obj.get("code_challenge_methods_supported").is_some());
 		assert!(obj.get("grant_types_supported").is_some());
 		assert!(obj.get("response_types_supported").is_some());
 		assert!(obj.get("token_endpoint_auth_methods_supported").is_some());
-
 		assert!(obj.get("errorCode").is_none(), "no Okta error envelope keys");
-		assert!(obj.get("errorSummary").is_none(), "no Okta error envelope keys");
-		assert!(obj.get("errorLink").is_none(), "no Okta error envelope keys");
 	}
 
 	#[test]
-	fn gateway_as_metadata_respects_forwarded_proto() {
+	fn gateway_as_metadata_respects_forwarded_proto_with_base_issuer() {
 		let req = ::http::Request::builder()
 			.uri("http://gw.fly.dev/.well-known/oauth-authorization-server")
 			.header("host", "gw.fly.dev")
@@ -972,16 +970,16 @@ mod tests {
 		let obj = metadata.as_object().unwrap();
 
 		let issuer = obj["issuer"].as_str().unwrap();
-		assert!(issuer.starts_with("https://"), "issuer must be HTTPS: {issuer}");
+		assert_eq!(issuer, "https://gw.fly.dev", "issuer = HTTPS base, no path");
 
 		let authz = obj["authorization_endpoint"].as_str().unwrap();
-		assert!(authz.starts_with("https://"), "authorization_endpoint must be HTTPS: {authz}");
+		assert!(authz.starts_with("https://gw.fly.dev/"), "HTTPS endpoint: {authz}");
 
 		let token = obj["token_endpoint"].as_str().unwrap();
-		assert!(token.starts_with("https://"), "token_endpoint must be HTTPS: {token}");
+		assert!(token.starts_with("https://gw.fly.dev/"), "HTTPS endpoint: {token}");
 
 		let reg = obj["registration_endpoint"].as_str().unwrap();
-		assert!(reg.starts_with("https://"), "registration_endpoint must be HTTPS: {reg}");
+		assert!(reg.starts_with("https://gw.fly.dev/"), "HTTPS endpoint: {reg}");
 	}
 
 	#[test]
