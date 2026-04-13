@@ -237,15 +237,27 @@ pub(crate) fn is_well_known_endpoint(path: &str) -> bool {
 /// accessible without a pre-existing bearer JWT. This includes well-known discovery
 /// endpoints AND OAuth flow entry points (registration, authorize, callback, token)
 /// regardless of where they are mounted in the route tree.
+///
+/// Matching is intentionally broad: any path whose terminal or penultimate segment is an
+/// OAuth flow keyword is exempt. This handles:
+///   - `/.well-known/oauth-authorization-server/authorize`
+///   - `/mcp/authorize`, `/mcp/authorize/`
+///   - `/x/y/mcp/authorize?client_id=...`
+///   - `/prefix/client-registration/some-client-id` (registration GET/DELETE)
 pub(crate) fn is_oauth_bootstrap_path(path: &str) -> bool {
 	if is_well_known_endpoint(path) {
 		return true;
 	}
-	let segment = path.rsplit('/').next().unwrap_or("");
-	matches!(
-		segment,
-		"client-registration" | "authorize" | "callback" | "token"
-	)
+	let normalized = path.trim_end_matches('/');
+	for segment in normalized.rsplit('/').take(2) {
+		if matches!(
+			segment,
+			"client-registration" | "authorize" | "callback" | "token"
+		) {
+			return true;
+		}
+	}
+	false
 }
 
 pub(super) async fn apply_token_validation(
@@ -281,7 +293,14 @@ pub(crate) async fn enforce_authentication(
 	auth: &McpAuthentication,
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
-	if !is_oauth_bootstrap_path(req.uri().path()) {
+	let path = req.uri().path();
+	let exempt = is_oauth_bootstrap_path(path);
+	debug!(
+		path = %path,
+		bootstrap_exempt = exempt,
+		"MCP auth: evaluating request"
+	);
+	if !exempt {
 		apply_token_validation(req, auth).await?;
 	}
 
@@ -785,19 +804,30 @@ mod tests {
 	#[test]
 	fn oauth_bootstrap_paths_are_exempt_from_jwt() {
 		let exempt = [
+			// Well-known discovery paths
 			"/.well-known/oauth-authorization-server",
 			"/.well-known/oauth-authorization-server/authorize",
 			"/.well-known/oauth-authorization-server/token",
 			"/.well-known/oauth-authorization-server/callback",
 			"/.well-known/oauth-authorization-server/client-registration",
 			"/.well-known/oauth-protected-resource/mcp",
+			// Custom-mounted OAuth flow endpoints
 			"/mcp/authorize",
 			"/mcp/token",
 			"/mcp/callback",
 			"/mcp/client-registration",
+			// Deeply nested
 			"/any/prefix/authorize",
 			"/any/prefix/token",
 			"/any/prefix/callback",
+			"/x/y/mcp/authorize",
+			// Trailing slash variants
+			"/mcp/authorize/",
+			"/mcp/token/",
+			"/mcp/callback/",
+			// Registration sub-paths (GET/DELETE with client_id)
+			"/mcp/client-registration/agw_abc123",
+			"/.well-known/oauth-authorization-server/client-registration/agw_abc123",
 		];
 		for path in exempt {
 			assert!(
@@ -815,6 +845,7 @@ mod tests {
 			"/some/tool/invoke",
 			"/api/resources",
 			"/health",
+			"/",
 		];
 		for path in protected {
 			assert!(
