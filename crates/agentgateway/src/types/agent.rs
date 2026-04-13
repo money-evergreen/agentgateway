@@ -2146,7 +2146,7 @@ impl JwtAuthentication {
 		req: &mut crate::http::Request,
 	) -> Result<(), crate::proxy::ProxyResponse> {
 		if let Some(auth) = &self.mcp {
-			if !crate::mcp::auth::is_well_known_endpoint(req.uri().path()) {
+			if !crate::mcp::auth::is_oauth_bootstrap_path(req.uri().path()) {
 				self.jwt.apply(log, req).await.map_err(|e| {
 					crate::proxy::ProxyResponse::from(crate::mcp::auth::create_auth_required_response(
 						crate::proxy::ProxyError::JwtAuthenticationFailure(e),
