@@ -2173,7 +2173,7 @@ impl JwtAuthentication {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct McpAuthentication {
 	pub issuer: String,
 	pub audiences: Vec<String>,
@@ -2181,6 +2181,18 @@ pub struct McpAuthentication {
 	pub resource_metadata: ResourceMetadata,
 	pub jwt_validator: Arc<crate::http::jwt::Jwt>,
 	pub mode: McpAuthenticationMode,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub oidc_proxy: Option<OidcProxyConfig>,
+}
+
+/// Gateway's own OAuth2 client credentials with the downstream IDP,
+/// used when proxying the authorization code flow for locally registered MCP clients.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OidcProxyConfig {
+	pub client_id: String,
+	#[serde(serialize_with = "crate::serdes::ser_redact")]
+	pub client_secret: secrecy::SecretString,
 }
 
 #[apply(schema_enum!)]
@@ -2222,6 +2234,16 @@ pub struct LocalMcpAuthentication {
 	pub mode: McpAuthenticationMode,
 	#[serde(default)]
 	pub jwt_validation_options: http::jwt::JWTValidationOptions,
+	#[serde(default)]
+	pub oidc_proxy: Option<LocalOidcProxyConfig>,
+}
+
+/// Local (file-based) configuration for the OIDC proxy credentials.
+#[apply(schema_de!)]
+pub struct LocalOidcProxyConfig {
+	pub client_id: String,
+	#[cfg_attr(feature = "schema", schemars(with = "String"))]
+	pub client_secret: secrecy::SecretString,
 }
 
 impl LocalMcpAuthentication {
@@ -2260,6 +2282,10 @@ impl LocalMcpAuthentication {
 	) -> anyhow::Result<McpAuthentication> {
 		let jwt_cfg = self.as_jwt()?;
 		let jwt = jwt_cfg.try_into(client).await?;
+		let oidc_proxy = self.oidc_proxy.as_ref().map(|p| OidcProxyConfig {
+			client_id: p.client_id.clone(),
+			client_secret: p.client_secret.clone(),
+		});
 		Ok(McpAuthentication {
 			issuer: self.issuer.clone(),
 			audiences: self.audiences.clone(),
@@ -2267,6 +2293,7 @@ impl LocalMcpAuthentication {
 			resource_metadata: self.resource_metadata.clone(),
 			jwt_validator: Arc::new(jwt),
 			mode: self.mode,
+			oidc_proxy,
 		})
 	}
 }

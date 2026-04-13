@@ -287,6 +287,7 @@ fn build_mcp_authentication(
 		resource_metadata,
 		jwt_validator,
 		mode,
+		oidc_proxy: None,
 	}
 }
 

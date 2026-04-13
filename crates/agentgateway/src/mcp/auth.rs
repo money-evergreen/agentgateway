@@ -39,11 +39,11 @@ struct LocalClientRegistrationRequest {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct LocalClientRegistrationRecord {
-	client_id: String,
-	client_secret: String,
-	active: bool,
-	redirect_uris: Vec<String>,
+pub(super) struct LocalClientRegistrationRecord {
+	pub(super) client_id: String,
+	pub(super) client_secret: String,
+	pub(super) active: bool,
+	pub(super) redirect_uris: Vec<String>,
 	client_name: Option<String>,
 	token_endpoint_auth_method: String,
 	grant_types: Vec<String>,
@@ -221,6 +221,13 @@ impl LocalClientRegistry {
 	}
 }
 
+pub(super) fn get_registered_client(client_id: &str) -> Option<LocalClientRegistrationRecord> {
+	LOCAL_CLIENT_REGISTRY
+		.read()
+		.ok()
+		.and_then(|registry| registry.get(client_id))
+}
+
 pub(crate) fn is_well_known_endpoint(path: &str) -> bool {
 	path.starts_with("/.well-known/oauth-protected-resource")
 		|| path.starts_with("/.well-known/oauth-authorization-server")
@@ -274,9 +281,10 @@ pub(crate) async fn handle_mcp_request(
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
 	let _ = client;
-	match req.uri().path() {
+	let path = req.uri().path().to_string();
+	match path.as_str() {
 		// TODO: indicate this is a DirectResponse
-		path if path.contains("/client-registration") => Ok(Some(
+		p if p.contains("/client-registration") => Ok(Some(
 			client_registration(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -285,10 +293,45 @@ pub(crate) async fn handle_mcp_request(
 				})
 				.into_response(),
 		)),
-		path if path.starts_with("/.well-known/oauth-protected-resource") => Ok(Some(
+		p if p.starts_with("/.well-known/oauth-protected-resource") => Ok(Some(
 			protected_resource_metadata(req, auth).await.into_response(),
 		)),
-		path if path.starts_with("/.well-known/oauth-authorization-server") => Ok(Some(
+		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/authorize") =>
+		{
+			Ok(Some(
+				super::oidc_proxy::proxy_authorize(req, auth, client.clone())
+					.await
+					.map_err(|e| {
+						warn!("oidc proxy authorize error: {}", e);
+						StatusCode::INTERNAL_SERVER_ERROR
+					})
+					.into_response(),
+			))
+		},
+		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/callback") =>
+		{
+			Ok(Some(
+				super::oidc_proxy::proxy_callback(req, auth, client.clone())
+					.await
+					.map_err(|e| {
+						warn!("oidc proxy callback error: {}", e);
+						StatusCode::INTERNAL_SERVER_ERROR
+					})
+					.into_response(),
+			))
+		},
+		p if p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/token") => {
+			Ok(Some(
+				super::oidc_proxy::proxy_token(req, auth, client.clone())
+					.await
+					.map_err(|e| {
+						warn!("oidc proxy token error: {}", e);
+						StatusCode::INTERNAL_SERVER_ERROR
+					})
+					.into_response(),
+			))
+		},
+		p if p.starts_with("/.well-known/oauth-authorization-server") => Ok(Some(
 			authorization_server_metadata(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -460,6 +503,8 @@ pub(super) async fn authorization_server_metadata(
 		},
 		_ => {},
 	}
+
+	super::oidc_proxy::rewrite_as_metadata(&mut resp, req, auth);
 
 	let response = ::http::Response::builder()
 		.status(StatusCode::OK)
