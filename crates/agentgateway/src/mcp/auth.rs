@@ -66,10 +66,12 @@ pub(super) struct LocalClientRegistrationRecord {
 	pub(super) client_secret: String,
 	pub(super) active: bool,
 	pub(super) redirect_uris: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	client_name: Option<String>,
 	token_endpoint_auth_method: String,
 	grant_types: Vec<String>,
 	response_types: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	scope: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	client_uri: Option<String>,
@@ -321,7 +323,7 @@ pub(crate) fn is_oauth_bootstrap_path(path: &str) -> bool {
 	for segment in normalized.rsplit('/').take(2) {
 		if matches!(
 			segment,
-			"client-registration" | "authorize" | "callback" | "token"
+			"client-registration" | "register" | "authorize" | "callback" | "token"
 		) {
 			return true;
 		}
@@ -386,7 +388,7 @@ pub(crate) async fn handle_mcp_request(
 	let tail = path.rsplit('/').next().unwrap_or("");
 
 	match path.as_str() {
-		p if p.contains("/client-registration") || tail == "client-registration" => Ok(Some(
+		p if p.contains("/client-registration") || tail == "client-registration" || tail == "register" => Ok(Some(
 			client_registration(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -593,7 +595,8 @@ fn build_gateway_as_metadata(
 		"code_challenge_methods_supported": ["S256"],
 		"grant_types_supported": ["authorization_code"],
 		"response_types_supported": ["code"],
-		"token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+		"token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
+		"scopes_supported": ["openid", "profile", "offline_access"],
 		"jwks_uri": format!("{}/.well-known/jwks.json", auth.issuer.trim_end_matches('/')),
 	})
 }
@@ -1243,5 +1246,60 @@ mod tests {
 		.expect("parse");
 		let err = req.validate_and_normalize().unwrap_err();
 		assert!(err.contains("redirect_uris"), "must mention redirect_uris: {err}");
+	}
+
+	#[test]
+	fn dcr_response_omits_scope_when_absent() {
+		let mut registry = LocalClientRegistry::default();
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/cb"]
+		}))
+		.expect("parse");
+		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let json = serde_json::to_value(&record).expect("serialize");
+		assert!(json.get("scope").is_none(), "scope must be omitted, not null");
+		assert!(json.get("client_name").is_none(), "client_name must be omitted, not null");
+	}
+
+	#[test]
+	fn dcr_response_includes_scope_when_provided() {
+		let mut registry = LocalClientRegistry::default();
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/cb"],
+			"scope": "openid profile"
+		}))
+		.expect("parse");
+		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let json = serde_json::to_value(&record).expect("serialize");
+		assert_eq!(json["scope"], "openid profile");
+	}
+
+	#[test]
+	fn register_path_is_bootstrap_exempt() {
+		assert!(is_oauth_bootstrap_path("/mcp/register"));
+		assert!(is_oauth_bootstrap_path("/prefix/register"));
+		assert!(is_oauth_bootstrap_path("/register"));
+	}
+
+	#[test]
+	fn as_metadata_includes_none_auth_method_and_scopes() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/.well-known/oauth-authorization-server")
+			.header("host", "gw.example")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().unwrap();
+
+		let methods = obj["token_endpoint_auth_methods_supported"]
+			.as_array()
+			.expect("array");
+		let method_strs: Vec<&str> = methods.iter().filter_map(|v| v.as_str()).collect();
+		assert!(method_strs.contains(&"none"), "must include 'none': {method_strs:?}");
+		assert!(method_strs.contains(&"client_secret_basic"), "must include basic: {method_strs:?}");
+
+		let scopes = obj["scopes_supported"].as_array().expect("scopes_supported array");
+		assert!(!scopes.is_empty(), "scopes_supported must be non-empty");
 	}
 }
