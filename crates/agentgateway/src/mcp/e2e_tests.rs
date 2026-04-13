@@ -993,3 +993,109 @@ fn audience_mismatch_produces_deterministic_jwt_error() {
 	let err = validator.validate_claims(&token);
 	assert!(err.is_err(), "mismatched audience must fail validation");
 }
+
+// ---------------------------------------------------------------------------
+// Config validation (ENG-3582: fail-fast misconfig)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn okta_config_rejects_empty_audiences() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://dev-xxx.okta.com/oauth2/default",
+		"audiences": [],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://dev-xxx.okta.com/oauth2/default/v1/keys" }
+	}))
+	.expect("deserialize");
+
+	let err = config.validate_provider_config().unwrap_err();
+	let msg = err.to_string();
+	assert!(
+		msg.contains("audience") && msg.contains("okta"),
+		"error must mention audience and okta: {msg}"
+	);
+}
+
+#[test]
+fn okta_config_rejects_empty_issuer() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "",
+		"audiences": ["urn:test"],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://dev-xxx.okta.com/oauth2/default/v1/keys" }
+	}))
+	.expect("deserialize");
+
+	let err = config.validate_provider_config().unwrap_err();
+	let msg = err.to_string();
+	assert!(
+		msg.contains("issuer") && msg.contains("okta"),
+		"error must mention issuer and okta: {msg}"
+	);
+}
+
+#[test]
+fn okta_config_rejects_empty_proxy_client_id() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://dev-xxx.okta.com/oauth2/default",
+		"audiences": ["urn:test"],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://dev-xxx.okta.com/oauth2/default/v1/keys" },
+		"oidcProxy": {
+			"clientId": "",
+			"clientSecret": "some-secret"
+		}
+	}))
+	.expect("deserialize");
+
+	let err = config.validate_provider_config().unwrap_err();
+	let msg = err.to_string();
+	assert!(
+		msg.contains("clientId") && msg.contains("okta"),
+		"error must mention clientId and okta: {msg}"
+	);
+}
+
+#[test]
+fn okta_config_accepts_valid_configuration() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://dev-xxx.okta.com/oauth2/default",
+		"audiences": ["urn:test"],
+		"provider": { "okta": {} },
+		"resourceMetadata": {},
+		"jwks": { "url": "https://dev-xxx.okta.com/oauth2/default/v1/keys" }
+	}))
+	.expect("deserialize");
+
+	config
+		.validate_provider_config()
+		.expect("valid okta config should pass validation");
+}
+
+#[test]
+fn non_okta_provider_skips_okta_validation() {
+	use crate::types::agent::LocalMcpAuthentication;
+
+	let config: LocalMcpAuthentication = serde_json::from_value(json!({
+		"issuer": "https://idp.example",
+		"audiences": [],
+		"resourceMetadata": {},
+		"jwks": { "url": "https://idp.example/.well-known/jwks.json" }
+	}))
+	.expect("deserialize");
+
+	config
+		.validate_provider_config()
+		.expect("non-okta provider should not trigger okta-specific validation");
+}
