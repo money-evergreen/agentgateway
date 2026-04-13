@@ -22,6 +22,10 @@ on:
         description: Agentgateway SHA to validate (defaults to current SHA if omitted)
         required: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
