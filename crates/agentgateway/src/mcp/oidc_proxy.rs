@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use rand::RngExt;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::http::oauth::{authorization_server_metadata_url, openid_configuration_metadata_url};
 use crate::http::{Body, Request, Response};
@@ -82,6 +82,30 @@ impl OidcProxyStore {
 		}
 		Some(code)
 	}
+
+	fn revoke_by_client_id(&mut self, client_id: &str) -> (usize, usize) {
+		let tx_before = self.transactions.len();
+		self.transactions.retain(|_, t| t.client_id != client_id);
+		let tx_removed = tx_before - self.transactions.len();
+
+		let code_before = self.auth_codes.len();
+		self.auth_codes.retain(|_, c| c.client_id != client_id);
+		let code_removed = code_before - self.auth_codes.len();
+
+		(tx_removed, code_removed)
+	}
+}
+
+/// Purge all pending transactions and auth codes for a deactivated client.
+/// Returns (transactions_removed, auth_codes_removed).
+pub(super) fn revoke_client(client_id: &str) -> (usize, usize) {
+	match OIDC_PROXY_STORE.write() {
+		Ok(mut store) => store.revoke_by_client_id(client_id),
+		Err(_) => {
+			warn!(client_id = %client_id, "proxy store lock poisoned during revocation");
+			(0, 0)
+		},
+	}
 }
 
 #[derive(serde::Deserialize)]
@@ -139,6 +163,7 @@ pub(super) async fn proxy_authorize(
 	let registration = match registration {
 		Some(r) if r.active => r,
 		Some(_) => {
+			warn!(client_id = %client_id, audit_event = "authorize_rejected_deactivated", "authorize rejected: client deactivated");
 			return build_error_response(
 				StatusCode::BAD_REQUEST,
 				"invalid_client",
@@ -146,6 +171,7 @@ pub(super) async fn proxy_authorize(
 			);
 		},
 		None => {
+			warn!(client_id = %client_id, audit_event = "authorize_rejected_unknown", "authorize rejected: unknown client");
 			return build_error_response(
 				StatusCode::BAD_REQUEST,
 				"invalid_client",
@@ -155,6 +181,7 @@ pub(super) async fn proxy_authorize(
 	};
 
 	if !registration.redirect_uris.iter().any(|u| u == &redirect_uri) {
+		warn!(client_id = %client_id, audit_event = "authorize_rejected_redirect_uri", "authorize rejected: redirect_uri mismatch");
 		return build_error_response(
 			StatusCode::BAD_REQUEST,
 			"invalid_request",
@@ -184,6 +211,8 @@ pub(super) async fn proxy_authorize(
 		expires_at: now_unix().saturating_add(TRANSACTION_TTL.as_secs()),
 	};
 
+	let audit_client_id = tx.client_id.clone();
+
 	OIDC_PROXY_STORE
 		.write()
 		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
@@ -202,6 +231,12 @@ pub(super) async fn proxy_authorize(
 	}
 
 	let idp_authorize_url = append_query(&idp_metadata.authorization_endpoint, &idp_params);
+
+	info!(
+		client_id = %audit_client_id,
+		audit_event = "proxy_authorize_started",
+		"OIDC proxy authorization flow started; redirecting to IDP"
+	);
 
 	build_redirect_response(&idp_authorize_url)
 }
@@ -262,10 +297,18 @@ pub(super) async fn proxy_callback(
 		expires_at: now_unix().saturating_add(AUTH_CODE_TTL.as_secs()),
 	};
 
+	let audit_callback_client_id = auth_code_entry.client_id.clone();
+
 	OIDC_PROXY_STORE
 		.write()
 		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
 		.insert_auth_code(proxy_code.clone(), auth_code_entry);
+
+	info!(
+		client_id = %audit_callback_client_id,
+		audit_event = "proxy_callback_success",
+		"IDP code exchange succeeded; proxy auth code issued to client"
+	);
 
 	let redirect_params = [
 		("code", proxy_code),
@@ -309,6 +352,7 @@ pub(super) async fn proxy_token(
 	let registration = match registration {
 		Some(r) if r.active => r,
 		Some(_) => {
+			warn!(client_id = %client_id, audit_event = "token_rejected_deactivated", "token exchange rejected: client deactivated");
 			return build_error_response(
 				StatusCode::UNAUTHORIZED,
 				"invalid_client",
@@ -316,6 +360,7 @@ pub(super) async fn proxy_token(
 			);
 		},
 		None => {
+			warn!(client_id = %client_id, audit_event = "token_rejected_unknown", "token exchange rejected: unknown client");
 			return build_error_response(
 				StatusCode::UNAUTHORIZED,
 				"invalid_client",
@@ -325,6 +370,7 @@ pub(super) async fn proxy_token(
 	};
 
 	if !constant_time_eq(registration.client_secret.as_bytes(), client_secret.as_bytes()) {
+		warn!(client_id = %client_id, audit_event = "token_rejected_bad_secret", "token exchange rejected: client authentication failed");
 		return build_error_response(
 			StatusCode::UNAUTHORIZED,
 			"invalid_client",
@@ -350,6 +396,7 @@ pub(super) async fn proxy_token(
 		.map_err(|_| ProxyError::ProcessingString("proxy store lock poisoned".into()))?
 		.take_auth_code(&proxy_code)
 		.ok_or_else(|| {
+			warn!(client_id = %client_id, audit_event = "token_rejected_expired_code", "token exchange rejected: expired or replayed authorization code");
 			ProxyError::ProcessingString(
 				"expired or replayed authorization code; code not found".into(),
 			)
@@ -379,12 +426,19 @@ pub(super) async fn proxy_token(
 		expected_challenge.as_bytes(),
 		auth_code.client_code_challenge.as_bytes(),
 	) {
+		warn!(client_id = %client_id, audit_event = "token_rejected_pkce_mismatch", "token exchange rejected: PKCE code_verifier mismatch");
 		return build_error_response(
 			StatusCode::BAD_REQUEST,
 			"invalid_grant",
 			"code_verifier does not match code_challenge",
 		);
 	}
+
+	info!(
+		client_id = %client_id,
+		audit_event = "proxy_token_issued",
+		"proxy token exchange completed; tokens delivered to client"
+	);
 
 	let body = serde_json::to_vec(&auth_code.token_response)
 		.map_err(|e| ProxyError::ProcessingString(format!("failed to serialize tokens: {e}")))?;
@@ -762,6 +816,88 @@ mod tests {
 			expected_challenge.as_bytes(),
 			wrong_challenge.as_bytes()
 		));
+	}
+
+	#[test]
+	fn revoke_by_client_id_purges_matching_entries() {
+		let mut store = OidcProxyStore::default();
+		store.insert_transaction(
+			"tx-a".into(),
+			ProxyTransaction {
+				client_id: "target-client".into(),
+				client_redirect_uri: "https://example.com/cb".into(),
+				client_state: "s1".into(),
+				client_code_challenge: "ch1".into(),
+				idp_token_endpoint: "https://idp/token".into(),
+				gateway_pkce_verifier: "v1".into(),
+				client_scope: None,
+				expires_at: now_unix() + 600,
+			},
+		);
+		store.insert_transaction(
+			"tx-b".into(),
+			ProxyTransaction {
+				client_id: "other-client".into(),
+				client_redirect_uri: "https://example.com/cb".into(),
+				client_state: "s2".into(),
+				client_code_challenge: "ch2".into(),
+				idp_token_endpoint: "https://idp/token".into(),
+				gateway_pkce_verifier: "v2".into(),
+				client_scope: None,
+				expires_at: now_unix() + 600,
+			},
+		);
+		store.insert_auth_code(
+			"code-a".into(),
+			ProxyAuthCode {
+				client_id: "target-client".into(),
+				client_redirect_uri: "https://example.com/cb".into(),
+				client_code_challenge: "ch1".into(),
+				token_response: serde_json::json!({}),
+				expires_at: now_unix() + 300,
+			},
+		);
+		store.insert_auth_code(
+			"code-b".into(),
+			ProxyAuthCode {
+				client_id: "other-client".into(),
+				client_redirect_uri: "https://example.com/cb".into(),
+				client_code_challenge: "ch2".into(),
+				token_response: serde_json::json!({}),
+				expires_at: now_unix() + 300,
+			},
+		);
+
+		let (tx_removed, code_removed) = store.revoke_by_client_id("target-client");
+		assert_eq!(tx_removed, 1);
+		assert_eq!(code_removed, 1);
+		assert!(!store.transactions.contains_key("tx-a"));
+		assert!(store.transactions.contains_key("tx-b"));
+		assert!(!store.auth_codes.contains_key("code-a"));
+		assert!(store.auth_codes.contains_key("code-b"));
+	}
+
+	#[test]
+	fn revoke_nonexistent_client_is_noop() {
+		let mut store = OidcProxyStore::default();
+		store.insert_transaction(
+			"tx-1".into(),
+			ProxyTransaction {
+				client_id: "existing".into(),
+				client_redirect_uri: "https://example.com/cb".into(),
+				client_state: "s1".into(),
+				client_code_challenge: "ch1".into(),
+				idp_token_endpoint: "https://idp/token".into(),
+				gateway_pkce_verifier: "v1".into(),
+				client_scope: None,
+				expires_at: now_unix() + 600,
+			},
+		);
+
+		let (tx_removed, code_removed) = store.revoke_by_client_id("nonexistent");
+		assert_eq!(tx_removed, 0);
+		assert_eq!(code_removed, 0);
+		assert!(store.transactions.contains_key("tx-1"));
 	}
 
 	#[test]
