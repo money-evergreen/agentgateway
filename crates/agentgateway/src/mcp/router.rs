@@ -128,9 +128,7 @@ impl App {
 			if let Some(resp) = auth::enforce_authentication(&mut req, auth, &client).await? {
 				return Ok(resp);
 			}
-		} else if auth::is_oauth_bootstrap_path(req.uri().path())
-			&& let Some(resp) = auth::handle_mcp_request_unauthenticated(&mut req).await?
-		{
+		} else if let Some(resp) = auth::handle_mcp_request_unauthenticated(&mut req).await? {
 			return Ok(resp);
 		}
 

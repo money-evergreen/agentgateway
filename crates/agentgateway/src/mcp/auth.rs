@@ -382,44 +382,24 @@ pub(crate) async fn enforce_authentication(
 }
 
 /// Handle OAuth bootstrap paths when no MCP authentication is configured.
-/// Returns well-known metadata and registration endpoints; returns None for
-/// paths that require auth config (authorize, token, callback).
+/// Returns error responses for OAuth-specific paths; returns None for regular
+/// MCP requests to let them through to the handler normally.
 pub(crate) async fn handle_mcp_request_unauthenticated(
 	req: &mut Request,
 ) -> Result<Option<Response>, ProxyError> {
 	let path = req.uri().path().to_string();
-	let tail = path.rsplit('/').next().unwrap_or("");
 
-	match path.as_str() {
-		p if p.contains("/client-registration") || tail == "client-registration" || tail == "register" => {
-			Ok(Some(build_json_response(
-				StatusCode::BAD_REQUEST,
-				serde_json::json!({
-					"error": "invalid_request",
-					"error_description": "client registration requires mcpAuthentication configuration"
-				}),
-			)?.into_response()))
-		},
-		p if p.starts_with("/.well-known/oauth-authorization-server") && !p.ends_with("/authorize") && !p.ends_with("/token") && !p.ends_with("/callback") => {
-			Ok(Some(build_json_response(
-				StatusCode::BAD_REQUEST,
-				serde_json::json!({
-					"error": "invalid_request",
-					"error_description": "OAuth metadata requires mcpAuthentication configuration"
-				}),
-			)?.into_response()))
-		},
-		_ if matches!(tail, "authorize" | "token" | "callback") => {
-			Ok(Some(build_json_response(
-				StatusCode::BAD_REQUEST,
-				serde_json::json!({
-					"error": "invalid_request",
-					"error_description": "OAuth flow requires mcpAuthentication configuration"
-				}),
-			)?.into_response()))
-		},
-		_ => Ok(None),
+	if is_oauth_bootstrap_path(&path) {
+		return Ok(Some(build_json_response(
+			StatusCode::BAD_REQUEST,
+			serde_json::json!({
+				"error": "invalid_request",
+				"error_description": "OAuth/registration requires mcpAuthentication configuration"
+			}),
+		)?.into_response()));
 	}
+
+	Ok(None)
 }
 
 pub(crate) async fn handle_mcp_request(
