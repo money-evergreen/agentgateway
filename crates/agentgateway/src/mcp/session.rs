@@ -347,9 +347,21 @@ impl Session {
 					ClientRequest::CustomRequest(cr)
 					if cr.method.as_str().contains("/list") =>
 				{
+					let method_str = cr.method.as_str();
+					let merge = if method_str.contains("tools") {
+						self.relay.merge_tools(cel)
+					} else if method_str.contains("prompts") {
+						self.relay.merge_prompts(cel)
+					} else if method_str.contains("templates") {
+						self.relay.merge_resource_templates(cel)
+					} else if method_str.contains("resources") {
+						self.relay.merge_resources(cel)
+					} else {
+						self.relay.merge_empty()
+					};
 					self
 						.relay
-						.send_fanout_tolerant(r, ctx, self.relay.merge_empty())
+						.send_fanout_tolerant(r, ctx, merge)
 						.await
 				},
 				ClientRequest::ListTasksRequest(_)
