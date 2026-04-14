@@ -344,14 +344,21 @@ impl Session {
 						}
 					},
 
-					ClientRequest::ListTasksRequest(_)
+					ClientRequest::CustomRequest(cr)
+					if cr.method.as_str().contains("/list") =>
+				{
+					self
+						.relay
+						.send_fanout_tolerant(r, ctx, self.relay.merge_empty())
+						.await
+				},
+				ClientRequest::ListTasksRequest(_)
 					| ClientRequest::GetTaskInfoRequest(_)
 					| ClientRequest::GetTaskResultRequest(_)
 					| ClientRequest::CancelTaskRequest(_)
 					| ClientRequest::SubscribeRequest(_)
 					| ClientRequest::UnsubscribeRequest(_)
 					| ClientRequest::CustomRequest(_) => {
-						// TODO(https://github.com/agentgateway/agentgateway/issues/404)
 						Err(UpstreamError::InvalidMethod(r.request.method().to_string()))
 					},
 					ClientRequest::CompleteRequest(_) => {
