@@ -695,14 +695,24 @@ fn derive_scheme_and_host(req: &Request) -> (String, String) {
 		.map(|s| s.to_string())
 		.unwrap_or_else(|| uri.scheme_str().unwrap_or("http").to_string());
 
-	let host = req
+	let mut host = req
 		.headers()
 		.get("x-forwarded-host")
 		.and_then(|v| v.to_str().ok())
 		.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
-		.or_else(|| uri.host())
-		.unwrap_or("localhost")
+		.unwrap_or_else(|| uri.host().unwrap_or("localhost"))
 		.to_string();
+
+	if !host.contains(':') {
+		let is_default_port = |s: &str, p: u16| {
+			(s == "https" && p == 443) || (s == "http" && p == 80)
+		};
+		if let Some(port) = uri.port_u16()
+			&& !is_default_port(&scheme, port)
+		{
+			host = format!("{host}:{port}");
+		}
+	}
 
 	(scheme, host)
 }
@@ -1078,6 +1088,44 @@ mod tests {
 
 		let issuer = obj["issuer"].as_str().unwrap();
 		assert_eq!(issuer, "http://localhost:3100", "local issuer must be http with port");
+
+		let endpoints = ["authorization_endpoint", "token_endpoint", "registration_endpoint"];
+		for ep in endpoints {
+			let v = obj[ep].as_str().unwrap();
+			assert!(v.starts_with("http://localhost:3100/"), "endpoint {ep} must include port: {v}");
+		}
+	}
+
+	#[test]
+	fn gateway_as_metadata_issuer_adds_port_from_uri_when_host_header_omits_it() {
+		let req = ::http::Request::builder()
+			.uri("http://localhost:3100/.well-known/oauth-authorization-server")
+			.header("host", "localhost")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().unwrap();
+
+		let issuer = obj["issuer"].as_str().unwrap();
+		assert_eq!(issuer, "http://localhost:3100", "port from URI must be preserved when host omits it");
+	}
+
+	#[test]
+	fn gateway_as_metadata_issuer_omits_default_port() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example:443/.well-known/oauth-authorization-server")
+			.header("host", "gw.example")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().unwrap();
+
+		let issuer = obj["issuer"].as_str().unwrap();
+		assert_eq!(issuer, "https://gw.example", "default port 443 must not appear in issuer");
 	}
 
 	#[test]
