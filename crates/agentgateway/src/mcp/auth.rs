@@ -320,10 +320,13 @@ pub(crate) fn is_oauth_bootstrap_path(path: &str) -> bool {
 		return true;
 	}
 	let normalized = path.trim_end_matches('/');
+	if normalized.ends_with("/auth/callback") {
+		return true;
+	}
 	for segment in normalized.rsplit('/').take(2) {
 		if matches!(
 			segment,
-			"client-registration" | "register" | "authorize" | "callback" | "token"
+			"client-registration" | "register" | "authorize" | "token"
 		) {
 			return true;
 		}
@@ -413,8 +416,7 @@ pub(crate) async fn handle_mcp_request(
 					.into_response(),
 			))
 		},
-		p if (p.starts_with("/.well-known/oauth-authorization-server") && p.ends_with("/callback"))
-			|| tail == "callback" =>
+		p if p.ends_with("/auth/callback") =>
 		{
 			Ok(Some(
 				super::oidc_proxy::proxy_callback(req, auth, client.clone())
@@ -987,23 +989,24 @@ mod tests {
 			"/.well-known/oauth-authorization-server",
 			"/.well-known/oauth-authorization-server/authorize",
 			"/.well-known/oauth-authorization-server/token",
-			"/.well-known/oauth-authorization-server/callback",
 			"/.well-known/oauth-authorization-server/client-registration",
 			"/.well-known/oauth-protected-resource/mcp",
 			// Custom-mounted OAuth flow endpoints
 			"/mcp/authorize",
 			"/mcp/token",
-			"/mcp/callback",
 			"/mcp/client-registration",
+			"/mcp/register",
+			// Canonical callback path
+			"/mcp/auth/callback",
+			"/prefix/auth/callback",
 			// Deeply nested
 			"/any/prefix/authorize",
 			"/any/prefix/token",
-			"/any/prefix/callback",
 			"/x/y/mcp/authorize",
 			// Trailing slash variants
 			"/mcp/authorize/",
 			"/mcp/token/",
-			"/mcp/callback/",
+			"/mcp/auth/callback/",
 			// Registration sub-paths (GET/DELETE with client_id)
 			"/mcp/client-registration/agw_abc123",
 			"/.well-known/oauth-authorization-server/client-registration/agw_abc123",
@@ -1096,6 +1099,7 @@ mod tests {
 			"/api/resources",
 			"/health",
 			"/",
+			"/mcp/callback",
 		];
 		for path in protected {
 			assert!(

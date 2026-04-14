@@ -742,20 +742,11 @@ fn extract_client_credentials(
 	Ok((client_id, client_secret))
 }
 
-fn derive_callback_url(req: &Request) -> String {
-	let base_url = super::auth::derive_public_base_url(req);
-	let uri = req
-		.extensions()
-		.get::<crate::http::filters::OriginalUrl>()
-		.map(|u| u.0.clone())
-		.unwrap_or_else(|| req.uri().clone());
-	let path = uri.path();
-	let parent = path
-		.rsplit_once('/')
-		.map(|(prefix, _)| prefix)
-		.unwrap_or(path);
+const CANONICAL_CALLBACK_PATH: &str = "/mcp/auth/callback";
 
-	base_url.replace(path, &format!("{parent}/callback"))
+fn derive_callback_url(req: &Request) -> String {
+	let issuer = super::auth::derive_public_issuer_url(req);
+	format!("{issuer}{CANONICAL_CALLBACK_PATH}")
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -953,5 +944,54 @@ mod tests {
 			format!("{prefix}:idx:client:c1:code"),
 			"agw:oidc:local:idx:client:c1:code"
 		);
+	}
+
+	#[test]
+	fn callback_url_is_always_canonical_path() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/mcp/authorize?foo=bar")
+			.header("host", "gw.example")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let url = derive_callback_url(&req);
+		assert_eq!(url, "https://gw.example/mcp/auth/callback");
+	}
+
+	#[test]
+	fn callback_url_from_well_known_path_is_canonical() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/.well-known/oauth-authorization-server/authorize")
+			.header("host", "gw.example")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let url = derive_callback_url(&req);
+		assert_eq!(url, "https://gw.example/mcp/auth/callback");
+		assert!(!url.contains(".well-known"), "callback must not use well-known path");
+	}
+
+	#[test]
+	fn callback_url_respects_forwarded_proto() {
+		let req = ::http::Request::builder()
+			.uri("http://gw.fly.dev/mcp/authorize")
+			.header("host", "gw.fly.dev")
+			.header("x-forwarded-proto", "https")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let url = derive_callback_url(&req);
+		assert_eq!(url, "https://gw.fly.dev/mcp/auth/callback");
+	}
+
+	#[test]
+	fn callback_url_never_contains_legacy_mcp_callback() {
+		for path in ["/mcp/authorize", "/.well-known/oauth-authorization-server/authorize", "/x/y/authorize"] {
+			let req = ::http::Request::builder()
+				.uri(format!("https://gw.example{path}"))
+				.header("host", "gw.example")
+				.body(crate::http::Body::empty())
+				.unwrap();
+			let url = derive_callback_url(&req);
+			assert!(!url.ends_with("/mcp/callback"), "must not use /mcp/callback: {url}");
+			assert!(url.ends_with("/mcp/auth/callback"), "must use canonical path: {url}");
+		}
 	}
 }
