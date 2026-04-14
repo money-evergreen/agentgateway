@@ -507,7 +507,11 @@ impl Relay {
 			));
 		}
 
-		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.upstreams.failure_mode);
+		let ms = if tolerant {
+			mergestream::MergeStream::new_tolerant(streams, id.clone(), merge, self.upstreams.failure_mode)
+		} else {
+			mergestream::MergeStream::new(streams, id.clone(), merge, self.upstreams.failure_mode)
+		};
 		messages_to_response(id, ms, None)
 	}
 	pub async fn send_notification(
