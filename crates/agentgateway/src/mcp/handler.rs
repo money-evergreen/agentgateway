@@ -480,14 +480,24 @@ impl Relay {
 		r: JsonRpcNotification<ClientNotification>,
 		ctx: IncomingRequestContext,
 	) -> Result<Response, UpstreamError> {
+		let is_initialized = matches!(
+			r.notification,
+			ClientNotification::InitializedNotification(_)
+		);
 		for (name, con) in self.upstreams.iter_named() {
 			match con.generic_notification(r.notification.clone(), &ctx).await {
 				Ok(_) => {},
 				Err(e) => {
-					if self.upstreams.failure_mode == FailureMode::FailOpen {
+					if is_initialized || self.upstreams.failure_mode == FailureMode::FailOpen {
 						warn!(
-							"upstream '{}' failed during notification, skipping: {}",
-							name, e
+							"upstream '{}' failed during notification ({}), continuing: {}",
+							name,
+							if is_initialized {
+								"initialized notification is best-effort"
+							} else {
+								"fail_open mode"
+							},
+							e,
 						);
 					} else {
 						return Err(e);
