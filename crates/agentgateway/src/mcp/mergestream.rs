@@ -100,11 +100,12 @@ pub struct MergeStream {
 	req_id: RequestId,
 	merge: Option<Box<MergeFn>>,
 	failure_mode: FailureMode,
+	tolerant: bool,
 }
 
 impl MergeStream {
 	pub fn new_without_merge(streams: Vec<(Strng, Messages)>, failure_mode: FailureMode) -> Self {
-		Self::new_internal(streams, RequestId::Number(0), None, failure_mode)
+		Self::new_internal(streams, RequestId::Number(0), None, failure_mode, false)
 	}
 	pub fn new(
 		streams: Vec<(Strng, Messages)>,
@@ -112,13 +113,22 @@ impl MergeStream {
 		merge: Box<MergeFn>,
 		failure_mode: FailureMode,
 	) -> Self {
-		Self::new_internal(streams, req_id, Some(merge), failure_mode)
+		Self::new_internal(streams, req_id, Some(merge), failure_mode, false)
+	}
+	pub fn new_tolerant(
+		streams: Vec<(Strng, Messages)>,
+		req_id: RequestId,
+		merge: Box<MergeFn>,
+		failure_mode: FailureMode,
+	) -> Self {
+		Self::new_internal(streams, req_id, Some(merge), failure_mode, true)
 	}
 	fn new_internal(
 		streams: Vec<(Strng, Messages)>,
 		req_id: RequestId,
 		merge: Option<Box<MergeFn>>,
 		failure_mode: FailureMode,
+		tolerant: bool,
 	) -> Self {
 		let terminal_messages = streams.iter().map(|_| None).collect::<Vec<_>>();
 		Self {
@@ -128,6 +138,7 @@ impl MergeStream {
 			complete: false,
 			merge,
 			failure_mode,
+			tolerant,
 		}
 	}
 
@@ -176,25 +187,28 @@ impl Stream for MergeStream {
 							self.terminal_messages[i] = Some((k, r.result));
 							// This stream is done, never look at it again
 						},
-						Err(e) => {
-							if self.failure_mode == FailureMode::FailOpen {
-								warn!(
-									"upstream stream error, skipping (failure_mode=FailOpen): {}",
-									e
-								);
-								drop = true;
-							} else {
-								self.complete = true;
-								return Poll::Ready(Some(Err(e)));
-							}
-						},
+					Err(e) => {
+						if self.tolerant || self.failure_mode == FailureMode::FailOpen {
+							warn!(
+								upstream = %k,
+								"upstream stream error during list fanout, skipping: {}",
+								e
+							);
+							drop = true;
+						} else {
+							self.complete = true;
+							return Poll::Ready(Some(Err(e)));
+						}
+					},
 						_ => return Poll::Ready(Some(msg)),
 					}
 				},
 				Poll::Ready(None) => {
-					// Stream ended without terminal message (shouldn't happen in this design)
-					if self.failure_mode == FailureMode::FailOpen {
-						warn!("upstream stream ended unexpectedly, skipping (failure_mode=FailOpen)");
+					if self.tolerant || self.failure_mode == FailureMode::FailOpen {
+						warn!(
+							upstream = %k,
+							"upstream stream ended without terminal message, skipping"
+						);
 						drop = true;
 					} else {
 						self.complete = true;
