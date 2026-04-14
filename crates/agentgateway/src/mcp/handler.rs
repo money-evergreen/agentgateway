@@ -446,14 +446,40 @@ impl Relay {
 		ctx: IncomingRequestContext,
 		merge: Box<MergeFn>,
 	) -> Result<Response, UpstreamError> {
+		self.send_fanout_inner(r, ctx, merge, false).await
+	}
+
+	pub async fn send_fanout_tolerant(
+		&self,
+		r: JsonRpcRequest<ClientRequest>,
+		ctx: IncomingRequestContext,
+		merge: Box<MergeFn>,
+	) -> Result<Response, UpstreamError> {
+		self.send_fanout_inner(r, ctx, merge, true).await
+	}
+
+	async fn send_fanout_inner(
+		&self,
+		r: JsonRpcRequest<ClientRequest>,
+		ctx: IncomingRequestContext,
+		merge: Box<MergeFn>,
+		tolerant: bool,
+	) -> Result<Response, UpstreamError> {
 		let id = r.id.clone();
+		let method = format!("{:?}", r.request).split('(').next().unwrap_or("unknown").to_string();
 		let mut streams = Vec::new();
 		for (name, con) in self.upstreams.iter_named() {
 			match con.generic_stream(r.clone(), &ctx).await {
 				Ok(s) => streams.push((name, s)),
 				Err(e) => {
-					if self.upstreams.failure_mode == FailureMode::FailOpen {
-						warn!("upstream '{}' failed during fanout, skipping: {}", name, e);
+					if tolerant || self.upstreams.failure_mode == FailureMode::FailOpen {
+						warn!(
+							upstream = %name,
+							mcp.method.name = %method,
+							error_kind = %e,
+							degraded_mode = tolerant,
+							"upstream failed during fanout, continuing with partial results",
+						);
 					} else {
 						return Err(e);
 					}
@@ -462,13 +488,8 @@ impl Relay {
 		}
 
 		if streams.is_empty() {
-			// Unlike GET fanout, ordinary request fanout does not have a transport-level
-			// "stay connected" fallback, and most MCP methods do not have a safe generic
-			// synthetic success response. By the time we get here, every initialized
-			// upstream has failed this request, so we surface that as an error even in
-			// FailOpen rather than inventing a method-specific response.
 			return Err(UpstreamError::InvalidRequest(
-				"no upstreams available".to_string(),
+				format!("no upstreams available for {method}"),
 			));
 		}
 

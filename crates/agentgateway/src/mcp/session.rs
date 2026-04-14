@@ -231,51 +231,47 @@ impl Session {
 						}
 						res
 					},
-					ClientRequest::ListToolsRequest(_) => {
+				ClientRequest::ListToolsRequest(_) => {
+					self
+						.relay
+						.send_fanout_tolerant(r, ctx, self.relay.merge_tools(cel))
+						.await
+				},
+				ClientRequest::PingRequest(_) | ClientRequest::SetLevelRequest(_) => {
+					self
+						.relay
+						.send_fanout(r, ctx, self.relay.merge_empty())
+						.await
+				},
+				ClientRequest::ListPromptsRequest(_) => {
+					self
+						.relay
+						.send_fanout_tolerant(r, ctx, self.relay.merge_prompts(cel))
+						.await
+				},
+				ClientRequest::ListResourcesRequest(_) => {
+					if !self.relay.is_multiplexing() {
 						self
 							.relay
-							.send_fanout(r, ctx, self.relay.merge_tools(cel))
+							.send_fanout_tolerant(r, ctx, self.relay.merge_resources(cel))
 							.await
-					},
-					ClientRequest::PingRequest(_) | ClientRequest::SetLevelRequest(_) => {
+					} else {
+						Err(UpstreamError::InvalidMethodWithMultiplexing(
+							r.request.method().to_string(),
+						))
+					}
+				},
+				ClientRequest::ListResourceTemplatesRequest(_) => {
+					if !self.relay.is_multiplexing() {
 						self
 							.relay
-							.send_fanout(r, ctx, self.relay.merge_empty())
+							.send_fanout_tolerant(r, ctx, self.relay.merge_resource_templates(cel))
 							.await
-					},
-					ClientRequest::ListPromptsRequest(_) => {
-						self
-							.relay
-							.send_fanout(r, ctx, self.relay.merge_prompts(cel))
-							.await
-					},
-					ClientRequest::ListResourcesRequest(_) => {
-						if !self.relay.is_multiplexing() {
-							self
-								.relay
-								.send_fanout(r, ctx, self.relay.merge_resources(cel))
-								.await
-						} else {
-							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
-							// Find a mapping of URL
-							Err(UpstreamError::InvalidMethodWithMultiplexing(
-								r.request.method().to_string(),
-							))
-						}
-					},
-					ClientRequest::ListResourceTemplatesRequest(_) => {
-						if !self.relay.is_multiplexing() {
-							self
-								.relay
-								.send_fanout(r, ctx, self.relay.merge_resource_templates(cel))
-								.await
-						} else {
-							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
-							// Find a mapping of URL
-							Err(UpstreamError::InvalidMethodWithMultiplexing(
-								r.request.method().to_string(),
-							))
-						}
+					} else {
+						Err(UpstreamError::InvalidMethodWithMultiplexing(
+							r.request.method().to_string(),
+						))
+					}
 					},
 					ClientRequest::CallToolRequest(ctr) => {
 						let name = ctr.params.name.clone();
