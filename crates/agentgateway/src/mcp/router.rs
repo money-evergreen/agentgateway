@@ -124,8 +124,12 @@ impl App {
 		// MCP context is added later. The context is inserted after
 		// authentication so it can include verified claims
 
-		if let Some(auth) = authn.as_ref()
-			&& let Some(resp) = auth::enforce_authentication(&mut req, auth, &client).await?
+		if let Some(auth) = authn.as_ref() {
+			if let Some(resp) = auth::enforce_authentication(&mut req, auth, &client).await? {
+				return Ok(resp);
+			}
+		} else if auth::is_oauth_bootstrap_path(req.uri().path())
+			&& let Some(resp) = auth::handle_mcp_request_unauthenticated(&mut req).await?
 		{
 			return Ok(resp);
 		}
