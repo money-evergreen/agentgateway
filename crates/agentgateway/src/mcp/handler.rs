@@ -488,6 +488,20 @@ impl Relay {
 		}
 
 		if streams.is_empty() {
+			if tolerant {
+				warn!(
+					mcp.method.name = %method,
+					"all upstreams failed for list operation; returning empty result",
+				);
+				let empty_result = merge(vec![]).map_err(|e| {
+					UpstreamError::InvalidRequest(format!("merge failed on empty input: {e}"))
+				})?;
+				return messages_to_response(
+					id.clone(),
+					mergestream::Messages::from_result(id, empty_result),
+					None,
+				);
+			}
 			return Err(UpstreamError::InvalidRequest(
 				format!("no upstreams available for {method}"),
 			));
