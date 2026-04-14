@@ -250,28 +250,16 @@ impl Session {
 						.await
 				},
 				ClientRequest::ListResourcesRequest(_) => {
-					if !self.relay.is_multiplexing() {
-						self
-							.relay
-							.send_fanout_tolerant(r, ctx, self.relay.merge_resources(cel))
-							.await
-					} else {
-						Err(UpstreamError::InvalidMethodWithMultiplexing(
-							r.request.method().to_string(),
-						))
-					}
+					self
+						.relay
+						.send_fanout_tolerant(r, ctx, self.relay.merge_resources(cel))
+						.await
 				},
 				ClientRequest::ListResourceTemplatesRequest(_) => {
-					if !self.relay.is_multiplexing() {
-						self
-							.relay
-							.send_fanout_tolerant(r, ctx, self.relay.merge_resource_templates(cel))
-							.await
-					} else {
-						Err(UpstreamError::InvalidMethodWithMultiplexing(
-							r.request.method().to_string(),
-						))
-					}
+					self
+						.relay
+						.send_fanout_tolerant(r, ctx, self.relay.merge_resource_templates(cel))
+						.await
 					},
 					ClientRequest::CallToolRequest(ctr) => {
 						let name = ctr.params.name.clone();
