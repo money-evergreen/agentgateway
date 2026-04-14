@@ -181,12 +181,19 @@ impl Stream for MergeStream {
 			let mut drop = false;
 			match res {
 				Poll::Ready(Some(msg)) => {
-					match msg {
-						Ok(ServerJsonRpcMessage::Response(r)) => {
-							drop = true;
-							self.terminal_messages[i] = Some((k, r.result));
-							// This stream is done, never look at it again
-						},
+				match msg {
+					Ok(ServerJsonRpcMessage::Response(r)) => {
+						drop = true;
+						self.terminal_messages[i] = Some((k, r.result));
+					},
+					Ok(ServerJsonRpcMessage::Error(e)) if self.tolerant => {
+						drop = true;
+						warn!(
+							upstream = %k,
+							error_code = e.error.code.0,
+							"upstream returned JSON-RPC error for list method, treating as unsupported",
+						);
+					},
 					Err(e) => {
 						if self.tolerant || self.failure_mode == FailureMode::FailOpen {
 							warn!(
@@ -200,8 +207,8 @@ impl Stream for MergeStream {
 							return Poll::Ready(Some(Err(e)));
 						}
 					},
-						_ => return Poll::Ready(Some(msg)),
-					}
+					_ => return Poll::Ready(Some(msg)),
+				}
 				},
 				Poll::Ready(None) => {
 					if self.tolerant || self.failure_mode == FailureMode::FailOpen {
