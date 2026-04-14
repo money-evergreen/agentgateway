@@ -130,7 +130,7 @@ impl LocalClientRegistrationRequest {
 		let auth_method = self
 			.token_endpoint_auth_method
 			.clone()
-			.unwrap_or_else(|| "client_secret_basic".into());
+			.unwrap_or_else(|| "none".into());
 		if !matches!(
 			auth_method.as_str(),
 			"client_secret_basic" | "client_secret_post" | "none"
@@ -222,7 +222,7 @@ impl LocalClientRegistry {
 			client_name: request.client_name,
 			token_endpoint_auth_method: request
 				.token_endpoint_auth_method
-				.unwrap_or_else(|| "client_secret_basic".into()),
+				.unwrap_or_else(|| "none".into()),
 			grant_types: request
 				.grant_types
 				.unwrap_or_else(|| vec!["authorization_code".into()]),
@@ -262,7 +262,7 @@ impl LocalClientRegistry {
 		existing.client_name = normalized.client_name;
 		existing.token_endpoint_auth_method = normalized
 			.token_endpoint_auth_method
-			.unwrap_or_else(|| "client_secret_basic".into());
+			.unwrap_or_else(|| "none".into());
 		existing.grant_types = normalized
 			.grant_types
 			.unwrap_or_else(|| vec!["authorization_code".into()]);
@@ -1305,5 +1305,31 @@ mod tests {
 
 		let scopes = obj["scopes_supported"].as_array().expect("scopes_supported array");
 		assert!(!scopes.is_empty(), "scopes_supported must be non-empty");
+	}
+
+	#[test]
+	fn registration_without_auth_method_defaults_to_none() {
+		let mut registry = LocalClientRegistry::default();
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/cb"]
+		}))
+		.expect("parse");
+		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		assert_eq!(
+			record.token_endpoint_auth_method, "none",
+			"absent token_endpoint_auth_method must default to none for public/native clients"
+		);
+	}
+
+	#[test]
+	fn registration_with_explicit_basic_stays_basic() {
+		let mut registry = LocalClientRegistry::default();
+		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
+			"redirect_uris": ["https://app.example/cb"],
+			"token_endpoint_auth_method": "client_secret_basic"
+		}))
+		.expect("parse");
+		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		assert_eq!(record.token_endpoint_auth_method, "client_secret_basic");
 	}
 }
