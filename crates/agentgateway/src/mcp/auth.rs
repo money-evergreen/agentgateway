@@ -693,7 +693,7 @@ fn derive_scheme_and_host(req: &Request) -> (String, String) {
 		.get("x-forwarded-proto")
 		.and_then(|v| v.to_str().ok())
 		.map(|s| s.to_string())
-		.unwrap_or_else(|| uri.scheme_str().unwrap_or("https").to_string());
+		.unwrap_or_else(|| uri.scheme_str().unwrap_or("http").to_string());
 
 	let host = req
 		.headers()
@@ -1062,6 +1062,22 @@ mod tests {
 		assert!(obj.get("response_types_supported").is_some());
 		assert!(obj.get("token_endpoint_auth_methods_supported").is_some());
 		assert!(obj.get("errorCode").is_none(), "no Okta error envelope keys");
+	}
+
+	#[test]
+	fn gateway_as_metadata_issuer_defaults_http_for_local() {
+		let req = ::http::Request::builder()
+			.uri("/.well-known/oauth-authorization-server")
+			.header("host", "localhost:3100")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let auth = test_auth_for_metadata("https://idp.example");
+
+		let metadata = build_gateway_as_metadata(&req, &auth);
+		let obj = metadata.as_object().unwrap();
+
+		let issuer = obj["issuer"].as_str().unwrap();
+		assert_eq!(issuer, "http://localhost:3100", "local issuer must be http with port");
 	}
 
 	#[test]
