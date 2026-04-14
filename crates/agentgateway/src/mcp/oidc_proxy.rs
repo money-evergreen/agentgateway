@@ -512,13 +512,32 @@ pub(super) async fn proxy_token(
 		},
 	};
 
-	if !constant_time_eq(registration.client_secret.as_bytes(), client_secret.as_bytes()) {
-		warn!(client_id = %client_id, audit_event = "token_rejected_bad_secret", "token exchange rejected: client authentication failed");
-		return build_error_response(
-			StatusCode::UNAUTHORIZED,
-			"invalid_client",
-			"client authentication failed",
-		);
+	match registration.token_endpoint_auth_method.as_str() {
+		"none" => {
+			// Public client: no secret required
+		},
+		_ => {
+			// Confidential client: secret required
+			let secret = match &client_secret {
+				Some(s) => s,
+				None => {
+					warn!(client_id = %client_id, audit_event = "token_rejected_missing_secret", "token exchange rejected: client_secret required");
+					return build_error_response(
+						StatusCode::UNAUTHORIZED,
+						"invalid_client",
+						"client_secret is required for this client's token_endpoint_auth_method",
+					);
+				},
+			};
+			if !constant_time_eq(registration.client_secret.as_bytes(), secret.as_bytes()) {
+				warn!(client_id = %client_id, audit_event = "token_rejected_bad_secret", "token exchange rejected: client authentication failed");
+				return build_error_response(
+					StatusCode::UNAUTHORIZED,
+					"invalid_client",
+					"client authentication failed",
+				);
+			}
+		},
 	}
 
 	let grant_type = required_form_param(&form_params, "grant_type")?;
@@ -703,7 +722,7 @@ async fn exchange_code_at_idp(
 fn extract_client_credentials(
 	req: &Request,
 	form_params: &HashMap<String, String>,
-) -> Result<(String, String), ProxyError> {
+) -> Result<(String, Option<String>), ProxyError> {
 	if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
 		let auth_str = auth_header
 			.to_str()
@@ -726,7 +745,7 @@ fn extract_client_credentials(
 					.map(|(k, _)| k.into_owned())
 					.next()
 					.unwrap_or_else(|| secret.to_string());
-				return Ok((id, secret));
+				return Ok((id, Some(secret)));
 			}
 		}
 	}
@@ -735,10 +754,7 @@ fn extract_client_credentials(
 		.get("client_id")
 		.ok_or_else(|| ProxyError::ProcessingString("missing client_id".into()))?
 		.clone();
-	let client_secret = form_params
-		.get("client_secret")
-		.ok_or_else(|| ProxyError::ProcessingString("missing client_secret".into()))?
-		.clone();
+	let client_secret = form_params.get("client_secret").cloned();
 	Ok((client_id, client_secret))
 }
 
@@ -993,5 +1009,46 @@ mod tests {
 			assert!(!url.ends_with("/mcp/callback"), "must not use /mcp/callback: {url}");
 			assert!(url.ends_with("/mcp/auth/callback"), "must use canonical path: {url}");
 		}
+	}
+
+	#[test]
+	fn extract_credentials_returns_none_secret_when_absent() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/token")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let mut params = HashMap::new();
+		params.insert("client_id".into(), "cid".into());
+		let (id, secret) = extract_client_credentials(&req, &params).unwrap();
+		assert_eq!(id, "cid");
+		assert!(secret.is_none(), "secret must be None when absent");
+	}
+
+	#[test]
+	fn extract_credentials_returns_some_secret_when_present() {
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/token")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let mut params = HashMap::new();
+		params.insert("client_id".into(), "cid".into());
+		params.insert("client_secret".into(), "sec".into());
+		let (id, secret) = extract_client_credentials(&req, &params).unwrap();
+		assert_eq!(id, "cid");
+		assert_eq!(secret.as_deref(), Some("sec"));
+	}
+
+	#[test]
+	fn extract_credentials_from_basic_auth_returns_some_secret() {
+		let encoded = base64::engine::general_purpose::STANDARD.encode("cid:sec");
+		let req = ::http::Request::builder()
+			.uri("https://gw.example/token")
+			.header("authorization", format!("Basic {encoded}"))
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let params = HashMap::new();
+		let (id, secret) = extract_client_credentials(&req, &params).unwrap();
+		assert_eq!(id, "cid");
+		assert_eq!(secret.as_deref(), Some("sec"));
 	}
 }

@@ -68,7 +68,7 @@ pub(super) struct LocalClientRegistrationRecord {
 	pub(super) redirect_uris: Vec<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	client_name: Option<String>,
-	token_endpoint_auth_method: String,
+	pub(super) token_endpoint_auth_method: String,
 	grant_types: Vec<String>,
 	response_types: Vec<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
