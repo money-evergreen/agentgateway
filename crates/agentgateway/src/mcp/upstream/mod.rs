@@ -56,6 +56,7 @@ impl IncomingRequestContext {
 				|| k == http::header::CONTENT_LENGTH
 				|| k == http::header::AUTHORIZATION
 				|| k.as_str().eq_ignore_ascii_case("mcp-session-id")
+				|| k.as_str().eq_ignore_ascii_case("mcp-protocol-version")
 			{
 				continue;
 			}
