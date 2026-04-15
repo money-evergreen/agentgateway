@@ -237,7 +237,21 @@ impl Session {
 						.send_fanout_tolerant(r, ctx, self.relay.merge_tools(cel))
 						.await
 				},
-				ClientRequest::PingRequest(_) | ClientRequest::SetLevelRequest(_) => {
+				ClientRequest::PingRequest(_) => {
+					let result = rmcp::model::ServerResult::empty(());
+					Ok(mcp::session::sse_stream_response(
+						futures::stream::once(async move {
+							crate::mcp::streamablehttp::ServerSseMessage {
+								event_id: None,
+								message: std::sync::Arc::new(
+									rmcp::model::ServerJsonRpcMessage::response(result, r.id),
+								),
+							}
+						}),
+						None,
+					))
+				},
+				ClientRequest::SetLevelRequest(_) => {
 					self
 						.relay
 						.send_fanout(r, ctx, self.relay.merge_empty())
