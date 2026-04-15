@@ -610,6 +610,17 @@ fn build_gateway_as_metadata(
 	let issuer = derive_public_issuer_url(req);
 	let endpoint_base = derive_public_base_url(req);
 
+	let mut scopes: Vec<String> = vec!["openid".into(), "profile".into(), "offline_access".into()];
+	if let Some(serde_json::Value::Array(configured)) = auth.resource_metadata.extra.get("scopesSupported") {
+		for s in configured {
+			if let Some(scope_str) = s.as_str()
+				&& !scopes.iter().any(|existing| existing == scope_str)
+			{
+				scopes.push(scope_str.to_string());
+			}
+		}
+	}
+
 	serde_json::json!({
 		"issuer": issuer,
 		"authorization_endpoint": format!("{endpoint_base}/authorize"),
@@ -619,7 +630,7 @@ fn build_gateway_as_metadata(
 		"grant_types_supported": ["authorization_code"],
 		"response_types_supported": ["code"],
 		"token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
-		"scopes_supported": ["openid", "profile", "offline_access"],
+		"scopes_supported": scopes,
 		"jwks_uri": format!("{}/.well-known/jwks.json", auth.issuer.trim_end_matches('/')),
 	})
 }
