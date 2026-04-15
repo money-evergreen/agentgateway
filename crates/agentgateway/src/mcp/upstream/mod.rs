@@ -52,8 +52,11 @@ impl IncomingRequestContext {
 	}
 	pub fn apply(&self, req: &mut http::Request) {
 		for (k, v) in &self.headers {
-			// Remove headers we do not want to propagate to the backend
-			if k == http::header::CONTENT_ENCODING || k == http::header::CONTENT_LENGTH {
+			if k == http::header::CONTENT_ENCODING
+				|| k == http::header::CONTENT_LENGTH
+				|| k == http::header::AUTHORIZATION
+				|| k.as_str().eq_ignore_ascii_case("mcp-session-id")
+			{
 				continue;
 			}
 			if !req.headers().contains_key(k) {

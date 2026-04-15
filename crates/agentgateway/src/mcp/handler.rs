@@ -409,31 +409,20 @@ impl Relay {
 			match con.get_event_stream(&ctx).await {
 				Ok(s) => streams.push((name, s)),
 				Err(e) => {
-					if self.upstreams.failure_mode == FailureMode::FailOpen {
-						let is_405 = if let UpstreamError::Http(ClientError::Status(ref r)) = e
-							&& r.status() == StatusCode::METHOD_NOT_ALLOWED
-						{
-							true
-						} else {
-							false
-						};
-						if !is_405 {
-							// per spec, a 405 is a valid response to say a GET stream is not supported so avoid log spam.
-							warn!("upstream '{}' failed for GET stream, skipping: {}", name, e);
-						} else {
-							debug!("upstream '{}' failed for GET stream, skipping: {}", name, e);
-						}
+					let is_405 = matches!(
+						&e,
+						UpstreamError::Http(ClientError::Status(r)) if r.status() == StatusCode::METHOD_NOT_ALLOWED
+					);
+					if is_405 {
+						debug!("upstream '{}' does not support GET stream, skipping", name);
 					} else {
-						return Err(e);
+						warn!("upstream '{}' failed for GET stream, skipping: {}", name, e);
 					}
 				},
 			}
 		}
 
 		if streams.is_empty() {
-			// FailClosed: unreachable — InitializeRequest would have failed with NoBackends.
-			// FailOpen: keep the SSE connection open so legacy SSE clients do not immediately
-			// reconnect in a tight loop after all upstream GET streams disappear.
 			return messages_to_response(RequestId::Number(0), Messages::pending(), None);
 		}
 
