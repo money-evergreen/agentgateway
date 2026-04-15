@@ -538,19 +538,14 @@ impl Relay {
 	}
 	fn get_info(
 		pv: ProtocolVersion,
-		multiplexing: bool,
+		_multiplexing: bool,
 		upstream_instructions: Vec<(String, String)>,
 	) -> ServerInfo {
-		let capabilities = if multiplexing {
-			// These are not supported when multiplexing.
-			ServerCapabilities::builder().enable_tools().build()
-		} else {
-			ServerCapabilities::builder()
-				.enable_tools()
-				.enable_prompts()
-				.enable_resources()
-				.build()
-		};
+		let capabilities = ServerCapabilities::builder()
+			.enable_tools()
+			.enable_prompts()
+			.enable_resources()
+			.build();
 		let gateway_preamble = "This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.";
 		let instructions = if upstream_instructions.is_empty() {
 			Some(gateway_preamble.to_string())
