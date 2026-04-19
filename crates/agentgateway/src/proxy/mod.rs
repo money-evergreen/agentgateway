@@ -295,6 +295,7 @@ impl ProxyError {
 			ProxyError::MCP(mcp::Error::NoBackends) => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::MCP(mcp::Error::UpstreamError(e)) => return e.0.map(http::Body::from),
 			ProxyError::MCP(mcp::Error::SendError(_, _)) => StatusCode::INTERNAL_SERVER_ERROR,
+			ProxyError::MCP(mcp::Error::MethodNotSupported(_, _)) => StatusCode::BAD_REQUEST,
 			// Note: we do not return a 401/403 here, as the obscure that it was rejected due to auth
 			ProxyError::MCP(mcp::Error::Authorization(_, _, _)) => StatusCode::BAD_REQUEST,
 		};
@@ -358,6 +359,27 @@ impl ProxyError {
 				None
 			};
 			let msg = err.unwrap_or_else(|| format!("failed to send message: {e}"));
+			return rb
+				.header("content-type", "application/json")
+				.body(http::Body::from(msg))
+				.unwrap();
+		}
+		if let ProxyError::MCP(ref e @ mcp::Error::MethodNotSupported(ref id, _)) = self {
+			let err = if let Some(req_id) = id {
+				serde_json::to_string(&JsonRpcError {
+					jsonrpc: Default::default(),
+					id: req_id.clone(),
+					error: ErrorData {
+						code: ErrorCode::METHOD_NOT_FOUND,
+						message: e.to_string().into(),
+						data: None,
+					},
+				})
+				.ok()
+			} else {
+				None
+			};
+			let msg = err.unwrap_or_else(|| e.to_string());
 			return rb
 				.header("content-type", "application/json")
 				.body(http::Body::from(msg))
