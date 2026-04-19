@@ -71,6 +71,8 @@ pub enum Error {
 	UpstreamError(Box<SendDirectResponse>),
 	#[error("send error: {}", .1)]
 	SendError(Option<RequestId>, String),
+	#[error("method not supported: {}", .1)]
+	MethodNotSupported(Option<RequestId>, String),
 	// Intentionally do NOT say its not authorized; we hide the existence of the tool
 	#[error("Unknown {1}: {2}")]
 	Authorization(RequestId, String, String),

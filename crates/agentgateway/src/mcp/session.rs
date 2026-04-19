@@ -168,14 +168,20 @@ impl Session {
 				Err(mcp::Error::UpstreamError(Box::new(resp)).into())
 			},
 			Err(UpstreamError::Proxy(p)) => Err(p),
-			Err(UpstreamError::Authorization {
-				resource_type,
-				resource_name,
-			}) if req_id.is_some() => {
-				Err(mcp::Error::Authorization(req_id.unwrap(), resource_type, resource_name).into())
-			},
-			// TODO: this is too broad. We have a big tangle of errors to untangle though
-			Err(e) => Err(mcp::Error::SendError(req_id, e.to_string()).into()),
+		Err(UpstreamError::Authorization {
+			resource_type,
+			resource_name,
+		}) if req_id.is_some() => {
+			Err(mcp::Error::Authorization(req_id.unwrap(), resource_type, resource_name).into())
+		},
+		Err(UpstreamError::InvalidMethod(method)) => {
+			Err(mcp::Error::MethodNotSupported(req_id, method).into())
+		},
+		Err(UpstreamError::InvalidMethodWithMultiplexing(method)) => {
+			Err(mcp::Error::MethodNotSupported(req_id, method).into())
+		},
+		// TODO: this is too broad. We have a big tangle of errors to untangle though
+		Err(e) => Err(mcp::Error::SendError(req_id, e.to_string()).into()),
 		}
 	}
 
