@@ -10,6 +10,7 @@ use crate::http::*;
 use crate::mcp::FailureMode;
 use crate::mcp::auth;
 use crate::mcp::handler::RelayInputs;
+use crate::mcp::list_cache::ListCacheManager;
 use crate::mcp::session::SessionManager;
 use crate::mcp::sse::LegacySSEService;
 use crate::mcp::streamablehttp::{StreamableHttpServerConfig, StreamableHttpService};
@@ -26,12 +27,17 @@ use crate::types::agent::{
 pub struct App {
 	state: Stores,
 	session: Arc<SessionManager>,
+	list_cache_manager: ListCacheManager,
 }
 
 impl App {
 	pub fn new(state: Stores, encoder: Encoder) -> Self {
 		let session: Arc<SessionManager> = Arc::new(crate::mcp::session::SessionManager::new(encoder));
-		Self { state, session }
+		Self {
+			state,
+			session,
+			list_cache_manager: ListCacheManager::new(),
+		}
 	}
 
 	pub fn should_passthrough(
@@ -109,6 +115,9 @@ impl App {
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
 		let authn = backend_policies.mcp_authentication;
+		let list_cache = self
+			.list_cache_manager
+			.get_or_create(backend_group_name.name.as_ref());
 
 		// Store an empty value, we will populate each field async
 		let logy = log.mcp_status.clone();
@@ -144,6 +153,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					list_cache: list_cache.clone(),
 				},
 			))
 			.await
@@ -160,6 +170,7 @@ impl App {
 					backend: backends.clone(),
 					policies: authorization_policies.clone(),
 					client: client.clone(),
+					list_cache: list_cache.clone(),
 				},
 			))
 			.await
