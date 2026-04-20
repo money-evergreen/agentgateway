@@ -205,7 +205,8 @@ impl Relay {
 					ServerResult::InitializeResult(ir) => Some(ir),
 					_ => None,
 				});
-				if let Some(ir) = res {
+				if let Some(mut ir) = res {
+					sanitize_resources_capability(&mut ir.capabilities);
 					return Ok(ir.into());
 				}
 				// If we got here in FailOpen mode, it means the only target failed.
@@ -563,6 +564,13 @@ impl Relay {
 				BuildInfo::new().version.to_string(),
 			))
 			.with_instructions(instructions.unwrap_or_default())
+	}
+}
+
+fn sanitize_resources_capability(capabilities: &mut ServerCapabilities) {
+	if let Some(ref mut res) = capabilities.resources {
+		res.subscribe = None;
+		res.list_changed = None;
 	}
 }
 
