@@ -384,15 +384,28 @@ impl Session {
 						.send_fanout_tolerant(r, ctx, merge)
 						.await
 				},
+			ClientRequest::SubscribeRequest(_)
+				| ClientRequest::UnsubscribeRequest(_) => {
+					let result = rmcp::model::ServerResult::empty(());
+					Ok(mcp::session::sse_stream_response(
+						futures::stream::once(async move {
+							crate::mcp::streamablehttp::ServerSseMessage {
+								event_id: None,
+								message: std::sync::Arc::new(
+									rmcp::model::ServerJsonRpcMessage::response(result, r.id),
+								),
+							}
+						}),
+						None,
+					))
+				},
 				ClientRequest::ListTasksRequest(_)
-					| ClientRequest::GetTaskInfoRequest(_)
-					| ClientRequest::GetTaskResultRequest(_)
-					| ClientRequest::CancelTaskRequest(_)
-					| ClientRequest::SubscribeRequest(_)
-					| ClientRequest::UnsubscribeRequest(_)
-					| ClientRequest::CustomRequest(_) => {
-						Err(UpstreamError::InvalidMethod(r.request.method().to_string()))
-					},
+				| ClientRequest::GetTaskInfoRequest(_)
+				| ClientRequest::GetTaskResultRequest(_)
+				| ClientRequest::CancelTaskRequest(_)
+				| ClientRequest::CustomRequest(_) => {
+					Err(UpstreamError::InvalidMethod(r.request.method().to_string()))
+				},
 					ClientRequest::CompleteRequest(_) => {
 						// For now, we don't have a sane mapping of incoming requests to a specific
 						// downstream service when multiplexing. Only forward when we have only one backend.
