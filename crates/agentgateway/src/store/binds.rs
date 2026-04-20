@@ -891,6 +891,10 @@ impl Store {
 		self.policies_by_key.values().cloned().collect()
 	}
 
+	pub fn all_backends(&self) -> Vec<Arc<BackendWithPolicies>> {
+		self.backends.values().cloned().collect()
+	}
+
 	pub fn backend(&self, r: &BackendKey) -> Option<Arc<BackendWithPolicies>> {
 		self.backends.get(r).cloned()
 	}

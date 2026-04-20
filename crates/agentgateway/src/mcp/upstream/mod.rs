@@ -33,7 +33,6 @@ pub struct IncomingRequestContext {
 }
 
 impl IncomingRequestContext {
-	#[cfg(test)]
 	pub fn empty() -> Self {
 		Self {
 			headers: http::HeaderMap::new(),

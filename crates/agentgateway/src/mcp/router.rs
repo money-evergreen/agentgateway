@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use agent_core::prelude::Strng;
 use axum::response::Response;
+use tracing::{debug, info, warn};
 
 use crate::ProxyInputs;
 use crate::http::authorization::RuleSets;
@@ -10,17 +11,19 @@ use crate::http::*;
 use crate::mcp::FailureMode;
 use crate::mcp::auth;
 use crate::mcp::handler::RelayInputs;
-use crate::mcp::list_cache::ListCacheManager;
+use crate::mcp::list_cache::{self, ListCacheManager};
 use crate::mcp::session::SessionManager;
 use crate::mcp::sse::LegacySSEService;
 use crate::mcp::streamablehttp::{StreamableHttpServerConfig, StreamableHttpService};
+use crate::mcp::upstream::IncomingRequestContext;
 use crate::mcp::{MCPInfo, McpAuthorizationSet};
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::{MustSnapshot, PolicyClient};
 use crate::store::{BackendPolicies, Stores};
 use crate::telemetry::log::RequestLog;
 use crate::types::agent::{
-	BackendTargetRef, McpBackend, McpTargetSpec, ResourceName, SimpleBackend, SimpleBackendReference,
+	Backend, BackendTargetRef, McpBackend, McpTargetSpec, ResourceName, SimpleBackend,
+	SimpleBackendReference,
 };
 
 #[derive(Debug, Clone)]
@@ -175,6 +178,162 @@ impl App {
 			))
 			.await
 		}
+	}
+
+	/// Pre-warm list caches for all MCP backends found in the bind store.
+	pub async fn warm_caches(&self, pi: Arc<ProxyInputs>) {
+		let backends: Vec<(ResourceName, McpBackend)> = {
+			let binds = self.state.read_binds();
+			binds
+				.all_backends()
+				.into_iter()
+				.filter_map(|bwp| match &bwp.backend {
+					Backend::MCP(name, mcp) => Some((name.clone(), mcp.clone())),
+					_ => None,
+				})
+				.collect()
+		};
+
+		if backends.is_empty() {
+			info!("no MCP backends configured, skipping cache warming");
+			return;
+		}
+
+		info!(
+			count = backends.len(),
+			"warming list caches for MCP backends"
+		);
+
+		for (name, mcp_backend) in backends {
+			let backend_name = name.name.to_string();
+			match self.warm_single_backend(&pi, name, mcp_backend).await {
+				Ok(()) => info!(backend = %backend_name, "cache warmed"),
+				Err(e) => warn!(backend = %backend_name, error = %e, "cache warming failed, will warm on first request"),
+			}
+		}
+	}
+
+	async fn warm_single_backend(
+		&self,
+		pi: &Arc<ProxyInputs>,
+		backend_group_name: ResourceName,
+		backend: McpBackend,
+	) -> Result<(), anyhow::Error> {
+		use rmcp::model::{
+			ClientInfo, ClientRequest, Implementation, JsonRpcRequest, ProtocolVersion, RequestId,
+		};
+
+		let backends = {
+			let binds = self.state.read_binds();
+			let nt = backend
+				.targets
+				.iter()
+				.map(|t| {
+					let be = t
+						.spec
+						.backend()
+						.map(|b| crate::proxy::resolve_simple_backend_with_policies(b, pi))
+						.transpose()?;
+					let inline_pols = be.as_ref().map(|pol| pol.inline_policies.as_slice());
+					let sub_backend_target = BackendTargetRef::Backend {
+						name: backend_group_name.name.as_ref(),
+						namespace: backend_group_name.namespace.as_ref(),
+						section: Some(t.name.as_ref()),
+					};
+					let backend_policies = BackendPolicies::default()
+						.merge(binds.sub_backend_policies(sub_backend_target, inline_pols));
+					Ok::<_, ProxyError>(Arc::new(McpTarget {
+						name: t.name.clone(),
+						spec: t.spec.clone(),
+						backend: be.map(|b| b.backend),
+						backend_policies,
+						always_use_prefix: backend.always_use_prefix,
+					}))
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+
+			McpBackendGroup {
+				targets: nt,
+				stateful: backend.stateful,
+				failure_mode: backend.failure_mode,
+			}
+		};
+
+		let list_cache = self
+			.list_cache_manager
+			.get_or_create(backend_group_name.name.as_ref());
+		let client = PolicyClient { inputs: pi.clone() };
+		let empty_policies = McpAuthorizationSet::new(RuleSets::from(Vec::new()));
+
+		let relay = RelayInputs {
+			backend: backends,
+			policies: empty_policies,
+			client,
+			list_cache,
+		}
+		.build_new_connections()?;
+
+		let ctx = IncomingRequestContext::empty();
+
+		let mut client_info = ClientInfo::default();
+		client_info.protocol_version = ProtocolVersion::V_2025_06_18;
+		client_info.client_info = Implementation::new("agentgateway-cache-warmer", "1.0");
+		let init_request = JsonRpcRequest {
+			jsonrpc: Default::default(),
+			id: RequestId::Number(0),
+			request: ClientRequest::InitializeRequest(
+				rmcp::model::InitializeRequest::new(client_info),
+			),
+		};
+		let _init_resp = relay
+			.send_fanout_tolerant(init_request, ctx.clone(), relay.merge_initialize(ProtocolVersion::V_2025_06_18, relay.is_multiplexing()))
+			.await
+			.map_err(|e| anyhow::anyhow!("initialize failed: {e}"))?;
+
+		let list_methods: &[&str] = &[
+			list_cache::TOOLS_LIST,
+			list_cache::PROMPTS_LIST,
+			list_cache::RESOURCES_LIST,
+			list_cache::RESOURCE_TEMPLATES_LIST,
+		];
+
+		for method in list_methods {
+			let cel = crate::mcp::rbac::CelExecWrapper::empty();
+			let (merge, request) = match *method {
+				list_cache::TOOLS_LIST => (
+					relay.merge_tools(cel),
+					ClientRequest::ListToolsRequest(Default::default()),
+				),
+				list_cache::PROMPTS_LIST => (
+					relay.merge_prompts(cel),
+					ClientRequest::ListPromptsRequest(Default::default()),
+				),
+				list_cache::RESOURCES_LIST => (
+					relay.merge_resources(cel),
+					ClientRequest::ListResourcesRequest(Default::default()),
+				),
+				list_cache::RESOURCE_TEMPLATES_LIST => (
+					relay.merge_resource_templates(cel),
+					ClientRequest::ListResourceTemplatesRequest(Default::default()),
+				),
+				_ => unreachable!(),
+			};
+			let rpc_request = JsonRpcRequest {
+				jsonrpc: Default::default(),
+				id: RequestId::Number(1),
+				request,
+			};
+			let caching = relay.caching_merge(method, merge);
+			match relay
+				.send_fanout_tolerant(rpc_request, ctx.clone(), caching)
+				.await
+			{
+				Ok(_) => debug!(method, "cached list response"),
+				Err(e) => warn!(method, error = %e, "failed to cache list response"),
+			}
+		}
+
+		Ok(())
 	}
 }
 
