@@ -15,6 +15,7 @@ use crate::http::sessionpersistence::MCPSession;
 use crate::mcp::FailureMode;
 use crate::mcp::McpAuthorization;
 use crate::mcp::handler::Relay;
+use crate::mcp::list_cache::ListCache;
 use crate::mcp::router::{McpBackendGroup, McpTarget};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::test_helpers::extauthmock::{ExtAuthMock, deny_response};
@@ -1621,6 +1622,10 @@ fn empty_mcp_policies() -> crate::mcp::McpAuthorizationSet {
 	crate::mcp::McpAuthorizationSet::new(crate::http::authorization::RuleSets::from(Vec::new()))
 }
 
+fn test_list_cache() -> std::sync::Arc<ListCache> {
+	std::sync::Arc::new(ListCache::new())
+}
+
 fn persisted_session(
 	target_name: &str,
 	session: &str,
@@ -1659,6 +1664,7 @@ fn test_openapi_targets_emit_stateless_session_state() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1707,6 +1713,7 @@ fn test_sse_targets_emit_stateless_session_state() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1752,6 +1759,7 @@ async fn test_stdio_targets_remain_non_stateless() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1775,6 +1783,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1808,6 +1817,7 @@ fn test_set_sessions_matches_by_target_name() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1857,6 +1867,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1901,6 +1912,7 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -1975,6 +1987,7 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 
@@ -2026,6 +2039,7 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 		PolicyClient {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
+		test_list_cache(),
 	)
 	.unwrap();
 

@@ -19,6 +19,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::http::Response;
 use crate::mcp::handler::{Relay, RelayInputs};
+use crate::mcp::list_cache;
 use crate::mcp::mergestream::Messages;
 use crate::mcp::streamablehttp::{ServerSseMessage, StreamableHttpPostResponse};
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
@@ -237,12 +238,20 @@ impl Session {
 						}
 						res
 					},
-				ClientRequest::ListToolsRequest(_) => {
-					self
-						.relay
-						.send_fanout_tolerant(r, ctx, self.relay.merge_tools(cel))
-						.await
-				},
+			ClientRequest::ListToolsRequest(_) => {
+				if let Some(raw) = self.relay.list_cache.get_raw(list_cache::TOOLS_LIST) {
+					let merge = self.relay.merge_tools(cel);
+					let result = merge(raw).map_err(|e| {
+						UpstreamError::InvalidRequest(format!("merge failed: {e}"))
+					})?;
+					return Ok(result_to_sse_response(result, r.id));
+				}
+				let merge = self.relay.caching_merge(
+					list_cache::TOOLS_LIST,
+					self.relay.merge_tools(cel),
+				);
+				self.relay.send_fanout_tolerant(r, ctx, merge).await
+			},
 				ClientRequest::PingRequest(_) => {
 					let result = rmcp::model::ServerResult::empty(());
 					Ok(mcp::session::sse_stream_response(
@@ -263,24 +272,48 @@ impl Session {
 						.send_fanout(r, ctx, self.relay.merge_empty())
 						.await
 				},
-				ClientRequest::ListPromptsRequest(_) => {
-					self
-						.relay
-						.send_fanout_tolerant(r, ctx, self.relay.merge_prompts(cel))
-						.await
+			ClientRequest::ListPromptsRequest(_) => {
+				if let Some(raw) = self.relay.list_cache.get_raw(list_cache::PROMPTS_LIST) {
+					let merge = self.relay.merge_prompts(cel);
+					let result = merge(raw).map_err(|e| {
+						UpstreamError::InvalidRequest(format!("merge failed: {e}"))
+					})?;
+					return Ok(result_to_sse_response(result, r.id));
+				}
+				let merge = self.relay.caching_merge(
+					list_cache::PROMPTS_LIST,
+					self.relay.merge_prompts(cel),
+				);
+				self.relay.send_fanout_tolerant(r, ctx, merge).await
+			},
+			ClientRequest::ListResourcesRequest(_) => {
+				if let Some(raw) = self.relay.list_cache.get_raw(list_cache::RESOURCES_LIST) {
+					let merge = self.relay.merge_resources(cel);
+					let result = merge(raw).map_err(|e| {
+						UpstreamError::InvalidRequest(format!("merge failed: {e}"))
+					})?;
+					return Ok(result_to_sse_response(result, r.id));
+				}
+				let merge = self.relay.caching_merge(
+					list_cache::RESOURCES_LIST,
+					self.relay.merge_resources(cel),
+				);
+				self.relay.send_fanout_tolerant(r, ctx, merge).await
+			},
+			ClientRequest::ListResourceTemplatesRequest(_) => {
+				if let Some(raw) = self.relay.list_cache.get_raw(list_cache::RESOURCE_TEMPLATES_LIST) {
+					let merge = self.relay.merge_resource_templates(cel);
+					let result = merge(raw).map_err(|e| {
+						UpstreamError::InvalidRequest(format!("merge failed: {e}"))
+					})?;
+					return Ok(result_to_sse_response(result, r.id));
+				}
+				let merge = self.relay.caching_merge(
+					list_cache::RESOURCE_TEMPLATES_LIST,
+					self.relay.merge_resource_templates(cel),
+				);
+				self.relay.send_fanout_tolerant(r, ctx, merge).await
 				},
-				ClientRequest::ListResourcesRequest(_) => {
-					self
-						.relay
-						.send_fanout_tolerant(r, ctx, self.relay.merge_resources(cel))
-						.await
-				},
-				ClientRequest::ListResourceTemplatesRequest(_) => {
-					self
-						.relay
-						.send_fanout_tolerant(r, ctx, self.relay.merge_resource_templates(cel))
-						.await
-					},
 					ClientRequest::CallToolRequest(ctr) => {
 						let name = ctr.params.name.clone();
 						let (service_name, tool) = self.relay.parse_resource_name(&name)?;
@@ -364,26 +397,34 @@ impl Session {
 						}
 					},
 
-					ClientRequest::CustomRequest(cr)
-					if cr.method.as_str().contains("/list") =>
-				{
-					let method_str = cr.method.as_str();
-					let merge = if method_str.contains("tools") {
-						self.relay.merge_tools(cel)
-					} else if method_str.contains("prompts") {
-						self.relay.merge_prompts(cel)
-					} else if method_str.contains("templates") {
-						self.relay.merge_resource_templates(cel)
-					} else if method_str.contains("resources") {
-						self.relay.merge_resources(cel)
-					} else {
-						self.relay.merge_empty()
-					};
-					self
-						.relay
-						.send_fanout_tolerant(r, ctx, merge)
-						.await
-				},
+				ClientRequest::CustomRequest(cr)
+				if cr.method.as_str().contains("/list") =>
+			{
+				let method_str = cr.method.as_str();
+				let (cache_key, merge) = if method_str.contains("tools") {
+					(Some(list_cache::TOOLS_LIST), self.relay.merge_tools(cel))
+				} else if method_str.contains("prompts") {
+					(Some(list_cache::PROMPTS_LIST), self.relay.merge_prompts(cel))
+				} else if method_str.contains("templates") {
+					(Some(list_cache::RESOURCE_TEMPLATES_LIST), self.relay.merge_resource_templates(cel))
+				} else if method_str.contains("resources") {
+					(Some(list_cache::RESOURCES_LIST), self.relay.merge_resources(cel))
+				} else {
+					(None, self.relay.merge_empty())
+				};
+				if let Some(key) = cache_key {
+					if let Some(raw) = self.relay.list_cache.get_raw(key) {
+						let result = merge(raw).map_err(|e| {
+							UpstreamError::InvalidRequest(format!("merge failed: {e}"))
+						})?;
+						return Ok(result_to_sse_response(result, r.id));
+					}
+					let merge = self.relay.caching_merge(key, merge);
+					self.relay.send_fanout_tolerant(r, ctx, merge).await
+				} else {
+					self.relay.send_fanout_tolerant(r, ctx, merge).await
+				}
+			},
 			ClientRequest::SubscribeRequest(_)
 				| ClientRequest::UnsubscribeRequest(_) => {
 					let result = rmcp::model::ServerResult::empty(());
@@ -585,6 +626,18 @@ impl Drop for SessionDropper {
 		sm.remove(s.id.as_ref());
 		tokio::task::spawn(async move { s.delete_session(parts).await });
 	}
+}
+
+fn result_to_sse_response(result: rmcp::model::ServerResult, id: RequestId) -> Response {
+	sse_stream_response(
+		futures::stream::once(async move {
+			ServerSseMessage {
+				event_id: None,
+				message: Arc::new(ServerJsonRpcMessage::response(result, id)),
+			}
+		}),
+		None,
+	)
 }
 
 pub(crate) fn sse_stream_response(

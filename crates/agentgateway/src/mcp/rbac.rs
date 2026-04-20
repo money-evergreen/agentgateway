@@ -26,6 +26,9 @@ impl CelExecWrapper {
 	pub fn new(req: ::http::Request<()>) -> CelExecWrapper {
 		CelExecWrapper(req)
 	}
+	pub fn empty() -> CelExecWrapper {
+		CelExecWrapper(::http::Request::new(()))
+	}
 }
 #[derive(Clone, Debug)]
 pub struct McpAuthorizationSet(RuleSets);

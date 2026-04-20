@@ -6,6 +6,7 @@ use crate::http::Response;
 use crate::http::sessionpersistence::MCPSession;
 use crate::mcp;
 use crate::mcp::FailureMode;
+use crate::mcp::list_cache::ListCache;
 use crate::mcp::mergestream::{MergeFn, Messages};
 use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
 use crate::mcp::router::McpBackendGroup;
@@ -41,17 +42,19 @@ fn resource_name(default_target_name: Option<&String>, target: &str, name: &str)
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
 	pub policies: McpAuthorizationSet,
+	pub list_cache: Arc<ListCache>,
 }
 
 pub struct RelayInputs {
 	pub backend: McpBackendGroup,
 	pub policies: McpAuthorizationSet,
 	pub client: PolicyClient,
+	pub list_cache: Arc<ListCache>,
 }
 
 impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
-		Relay::new(self.backend, self.policies, self.client)
+		Relay::new(self.backend, self.policies, self.client, self.list_cache)
 	}
 }
 
@@ -60,16 +63,19 @@ impl Relay {
 		backend: McpBackendGroup,
 		policies: McpAuthorizationSet,
 		client: PolicyClient,
+		list_cache: Arc<ListCache>,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
+			list_cache,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
 		Self {
 			upstreams: self.upstreams.clone(),
 			policies,
+			list_cache: self.list_cache.clone(),
 		}
 	}
 
@@ -149,6 +155,15 @@ impl Relay {
 	}
 	pub fn default_target_name(&self) -> Option<String> {
 		self.upstreams.default_target_name.clone()
+	}
+
+	pub fn caching_merge(&self, method: &str, inner: Box<MergeFn>) -> Box<MergeFn> {
+		let cache = self.list_cache.clone();
+		let method = method.to_string();
+		Box::new(move |streams| {
+			cache.set_raw(&method, streams.clone());
+			inner(streams)
+		})
 	}
 
 	pub fn merge_tools(&self, cel: CelExecWrapper) -> Box<MergeFn> {

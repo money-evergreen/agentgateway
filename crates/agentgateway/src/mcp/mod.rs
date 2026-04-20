@@ -2,6 +2,7 @@ pub(crate) mod auth;
 #[cfg(test)]
 mod e2e_tests;
 mod handler;
+pub(crate) mod list_cache;
 mod mergestream;
 pub(crate) mod oidc_proxy;
 mod rbac;
