@@ -385,8 +385,13 @@ pub(super) async fn proxy_authorize(
 		("code_challenge", gateway_code_challenge),
 		("code_challenge_method", "S256".to_string()),
 	];
-	if let Some(scope) = scope {
-		idp_params.push(("scope", scope));
+	{
+		let scope_value = match scope {
+			Some(s) if s.split_whitespace().any(|t| t == "offline_access") => s,
+			Some(s) => format!("{s} offline_access"),
+			None => "offline_access".to_string(),
+		};
+		idp_params.push(("scope", scope_value));
 	}
 
 	let idp_authorize_url = append_query(&idp_metadata.authorization_endpoint, &idp_params);
@@ -472,9 +477,9 @@ pub(super) async fn proxy_callback(
 pub(super) async fn proxy_token(
 	req: &mut Request,
 	auth: &McpAuthentication,
-	_client: PolicyClient,
+	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	let _proxy_cfg = auth
+	let proxy_cfg = auth
 		.oidc_proxy
 		.as_ref()
 		.ok_or_else(|| ProxyError::ProcessingString("OIDC proxy not configured".into()))?;
@@ -549,76 +554,109 @@ pub(super) async fn proxy_token(
 	}
 
 	let grant_type = required_form_param(&form_params, "grant_type")?;
-	if grant_type != "authorization_code" {
-		return build_error_response(
-			StatusCode::BAD_REQUEST,
-			"unsupported_grant_type",
-			"only grant_type=authorization_code is supported",
-		);
-	}
+	match grant_type.as_str() {
+		"authorization_code" => {
+			let proxy_code = required_form_param(&form_params, "code")?;
+			let redirect_uri = required_form_param(&form_params, "redirect_uri")?;
+			let code_verifier = required_form_param(&form_params, "code_verifier")?;
 
-	let proxy_code = required_form_param(&form_params, "code")?;
-	let redirect_uri = required_form_param(&form_params, "redirect_uri")?;
-	let code_verifier = required_form_param(&form_params, "code_verifier")?;
+			let auth_code = store
+				.take_auth_code(&proxy_code)
+				.await?
+				.ok_or_else(|| {
+					warn!(client_id = %client_id, audit_event = "token_rejected_expired_code", "token exchange rejected: expired or replayed authorization code");
+					ProxyError::ProcessingString(
+						"expired or replayed authorization code; code not found".into(),
+					)
+				})?;
 
-	let auth_code = store
-		.take_auth_code(&proxy_code)
-		.await?
-		.ok_or_else(|| {
-			warn!(client_id = %client_id, audit_event = "token_rejected_expired_code", "token exchange rejected: expired or replayed authorization code");
-			ProxyError::ProcessingString(
-				"expired or replayed authorization code; code not found".into(),
+			if auth_code.client_id != client_id {
+				return build_error_response(
+					StatusCode::BAD_REQUEST,
+					"invalid_grant",
+					"code was issued to a different client",
+				);
+			}
+
+			if auth_code.client_redirect_uri != redirect_uri {
+				return build_error_response(
+					StatusCode::BAD_REQUEST,
+					"invalid_grant",
+					"redirect_uri does not match the value used during authorization",
+				);
+			}
+
+			let expected_challenge = {
+				let digest = Sha256::digest(code_verifier.as_bytes());
+				base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+			};
+			if !constant_time_eq(
+				expected_challenge.as_bytes(),
+				auth_code.client_code_challenge.as_bytes(),
+			) {
+				warn!(client_id = %client_id, audit_event = "token_rejected_pkce_mismatch", "token exchange rejected: PKCE code_verifier mismatch");
+				return build_error_response(
+					StatusCode::BAD_REQUEST,
+					"invalid_grant",
+					"code_verifier does not match code_challenge",
+				);
+			}
+
+			info!(
+				client_id = %client_id,
+				audit_event = "proxy_token_issued",
+				"proxy token exchange completed; tokens delivered to client"
+			);
+
+			let body = serde_json::to_vec(&auth_code.token_response)
+				.map_err(|e| ProxyError::ProcessingString(format!("failed to serialize tokens: {e}")))?;
+
+			::http::Response::builder()
+				.status(StatusCode::OK)
+				.header(header::CONTENT_TYPE, "application/json")
+				.header(header::CACHE_CONTROL, "no-store")
+				.header(header::PRAGMA, "no-cache")
+				.body(Body::from(Bytes::from(body)))
+				.map_err(ProxyError::Http)
+		},
+		"refresh_token" => {
+			let refresh_token = required_form_param(&form_params, "refresh_token")?;
+
+			let idp_metadata = fetch_idp_metadata(auth, client.clone()).await?;
+
+			let token_response = refresh_token_at_idp(
+				client,
+				&idp_metadata.token_endpoint,
+				proxy_cfg,
+				&refresh_token,
 			)
-		})?;
+			.await?;
 
-	if auth_code.client_id != client_id {
-		return build_error_response(
-			StatusCode::BAD_REQUEST,
-			"invalid_grant",
-			"code was issued to a different client",
-		);
+			info!(
+				client_id = %client_id,
+				audit_event = "proxy_token_refreshed",
+				"proxy token refresh completed; new tokens delivered to client"
+			);
+
+			let body = serde_json::to_vec(&token_response)
+				.map_err(|e| ProxyError::ProcessingString(format!("failed to serialize tokens: {e}")))?;
+
+			::http::Response::builder()
+				.status(StatusCode::OK)
+				.header(header::CONTENT_TYPE, "application/json")
+				.header(header::CACHE_CONTROL, "no-store")
+				.header(header::PRAGMA, "no-cache")
+				.body(Body::from(Bytes::from(body)))
+				.map_err(ProxyError::Http)
+		},
+		_ => {
+			build_error_response(
+				StatusCode::BAD_REQUEST,
+				"unsupported_grant_type",
+				"supported grant types: authorization_code, refresh_token",
+			)
+		},
 	}
-
-	if auth_code.client_redirect_uri != redirect_uri {
-		return build_error_response(
-			StatusCode::BAD_REQUEST,
-			"invalid_grant",
-			"redirect_uri does not match the value used during authorization",
-		);
-	}
-
-	let expected_challenge = {
-		let digest = Sha256::digest(code_verifier.as_bytes());
-		base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-	};
-	if !constant_time_eq(
-		expected_challenge.as_bytes(),
-		auth_code.client_code_challenge.as_bytes(),
-	) {
-		warn!(client_id = %client_id, audit_event = "token_rejected_pkce_mismatch", "token exchange rejected: PKCE code_verifier mismatch");
-		return build_error_response(
-			StatusCode::BAD_REQUEST,
-			"invalid_grant",
-			"code_verifier does not match code_challenge",
-		);
-	}
-
-	info!(
-		client_id = %client_id,
-		audit_event = "proxy_token_issued",
-		"proxy token exchange completed; tokens delivered to client"
-	);
-
-	let body = serde_json::to_vec(&auth_code.token_response)
-		.map_err(|e| ProxyError::ProcessingString(format!("failed to serialize tokens: {e}")))?;
-
-	::http::Response::builder()
-		.status(StatusCode::OK)
-		.header(header::CONTENT_TYPE, "application/json")
-		.header(header::CACHE_CONTROL, "no-store")
-		.header(header::PRAGMA, "no-cache")
-		.body(Body::from(Bytes::from(body)))
-		.map_err(ProxyError::Http)
 }
 
 // rewrite_as_metadata is no longer needed — gateway AS metadata is built from scratch
@@ -677,6 +715,49 @@ async fn fetch_idp_metadata(
 	Ok(IdpMetadata {
 		authorization_endpoint,
 		token_endpoint,
+	})
+}
+
+async fn refresh_token_at_idp(
+	client: PolicyClient,
+	token_endpoint: &str,
+	proxy_cfg: &OidcProxyConfig,
+	refresh_token: &str,
+) -> Result<serde_json::Value, ProxyError> {
+	let form = [
+		("grant_type", "refresh_token"),
+		("refresh_token", refresh_token),
+		("client_id", proxy_cfg.client_id.as_str()),
+		("client_secret", proxy_cfg.client_secret.expose_secret()),
+	];
+	let body = serde_urlencoded::to_string(form)
+		.map_err(|e| ProxyError::ProcessingString(format!("failed to encode refresh form: {e}")))?;
+
+	let req = ::http::Request::builder()
+		.method(Method::POST)
+		.uri(token_endpoint)
+		.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+		.header(header::ACCEPT, "application/json")
+		.body(Body::from(body))?;
+
+	let resp = client.simple_call(req).await?;
+	let status = resp.status();
+	let body = crate::http::read_body_with_limit(resp.into_body(), TOKEN_RESPONSE_BODY_LIMIT)
+		.await
+		.map_err(|e| {
+			ProxyError::ProcessingString(format!("failed to read IDP refresh response: {e}"))
+		})?;
+
+	if !status.is_success() {
+		let error_body = String::from_utf8_lossy(&body);
+		debug!(status = %status, body = %error_body, "IDP token refresh failed");
+		return Err(ProxyError::ProcessingString(format!(
+			"IDP token endpoint returned {status}"
+		)));
+	}
+
+	serde_json::from_slice(&body).map_err(|e| {
+		ProxyError::ProcessingString(format!("failed to parse IDP refresh response: {e}"))
 	})
 }
 
