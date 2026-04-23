@@ -36,6 +36,7 @@ import {
   Settings,
   Route,
   Calculator,
+  LogOut,
 } from "lucide-react";
 import { useRouter, usePathname } from "next/navigation";
 import { useWizard } from "@/lib/wizard-context";
@@ -196,6 +197,18 @@ export function AppSidebar({ setActiveView }: AppSidebarProps) {
 
       <SidebarFooter>
         <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Sign Out"
+              onClick={() => {
+                window.location.href = window.location.origin + "/ui/logout";
+              }}
+              aria-label="Sign Out"
+            >
+              <LogOut className="h-4 w-4" />
+              <span>Sign Out</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton
               tooltip="Restart Setup Wizard"

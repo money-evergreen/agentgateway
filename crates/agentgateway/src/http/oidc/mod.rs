@@ -132,6 +132,14 @@ pub struct OidcPolicy {
 	pub redirect_uri: RedirectUri,
 	pub session: SessionConfig,
 	pub scopes: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub end_session_endpoint: Option<ProviderEndpoint>,
+	#[serde(
+		skip_serializing_if = "Option::is_none",
+		serialize_with = "ser_opt_path_and_query"
+	)]
+	pub logout_path: Option<http::uri::PathAndQuery>,
+	pub post_logout_redirect_uri: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -205,6 +213,12 @@ impl OidcPolicy {
 			return Ok(response);
 		}
 
+		if let Some(ref logout_path) = self.logout_path {
+			if req.method() == ::http::Method::GET && req.uri().path() == logout_path.path() {
+				return self.handle_logout(req);
+			}
+		}
+
 		if is_cors_preflight(req) {
 			return Ok(PolicyResponse::default());
 		}
@@ -235,6 +249,36 @@ impl OidcPolicy {
 
 		// OIDC is an interactive browser policy: unauthenticated non-callback requests enter login.
 		callback::start_login(self, req)
+	}
+
+	fn handle_logout(&self, req: &Request) -> Result<PolicyResponse, Error> {
+		let id_token_hint = read_cookie(req, &self.session.cookie_name)
+			.and_then(|cookie| self.session.decode_browser_session(&cookie).ok())
+			.map(|session| session.raw_id_token);
+
+		let clear_session = self
+			.session
+			.clear_cookie(&self.session.cookie_name, self.redirect_uri.https);
+
+		let location = match &self.end_session_endpoint {
+			Some(endpoint) => {
+				let mut params: Vec<(&str, String)> = vec![
+					("client_id", self.client.client_id.clone()),
+					(
+						"post_logout_redirect_uri",
+						self.post_logout_redirect_uri.clone(),
+					),
+				];
+				if let Some(hint) = &id_token_hint {
+					params.push(("id_token_hint", hint.expose_secret().to_string()));
+				}
+				endpoint.with_query(&params)
+			},
+			None => self.post_logout_redirect_uri.clone(),
+		};
+
+		let response = build_redirect_response(&location, &[clear_session])?;
+		Ok(PolicyResponse::default().with_response(response))
 	}
 
 	async fn maybe_handle_callback(
@@ -315,6 +359,16 @@ impl CallbackQuery {
 
 fn read_cookie(req: &Request, name: &str) -> Option<String> {
 	crate::http::read_request_cookie(req, name)
+}
+
+fn ser_opt_path_and_query<S: Serializer>(
+	value: &Option<http::uri::PathAndQuery>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	match value {
+		Some(pq) => serializer.serialize_str(pq.as_str()),
+		None => serializer.serialize_none(),
+	}
 }
 
 pub(crate) fn build_redirect_response(

@@ -129,6 +129,9 @@ fn test_policy() -> OidcPolicy {
 		redirect_uri: test_redirect_uri(),
 		session,
 		scopes: vec!["openid".into(), "profile".into()],
+		end_session_endpoint: None,
+		logout_path: None,
+		post_logout_redirect_uri: "/".into(),
 	}
 }
 
@@ -240,6 +243,9 @@ fn explicit_local_oidc_config() -> LocalOidcConfig {
 		client_secret: SecretString::new("client-secret".into()),
 		redirect_uri: test_redirect_uri().redirect_uri,
 		scopes: vec!["profile".into(), "email".into()],
+		end_session_endpoint: None,
+		logout_path: None,
+		post_logout_redirect_uri: None,
 	}
 }
 
@@ -920,6 +926,9 @@ async fn local_oidc_config_compiles_supported_provider_sources() {
 				client_secret: SecretString::new("client-secret".into()),
 				redirect_uri: "http://localhost:3000/oauth/callback".into(),
 				scopes: vec![],
+				end_session_endpoint: None,
+				logout_path: None,
+				post_logout_redirect_uri: None,
 			},
 			provider_endpoint(format!("{}/authorize", mock.uri())),
 			provider_endpoint(format!("{}/token", mock.uri())),
@@ -997,6 +1006,9 @@ async fn discovery_rejects_relative_provider_endpoints() {
 		client_secret: SecretString::new("client-secret".into()),
 		redirect_uri: "http://localhost:3000/oauth/callback".into(),
 		scopes: vec![],
+		end_session_endpoint: None,
+		logout_path: None,
+		post_logout_redirect_uri: None,
 	};
 	let err = compile_local_policy(policy, translated_policy_id("discovery-relative-endpoints"))
 		.await
@@ -1021,6 +1033,9 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				client_secret: SecretString::new("client-secret".into()),
 				redirect_uri: "http://localhost:3000/oauth/callback".into(),
 				scopes: vec![],
+				end_session_endpoint: None,
+				logout_path: None,
+				post_logout_redirect_uri: None,
 			},
 			"authorizationEndpoint, tokenEndpoint, and jwks must either all be set or all be omitted",
 		),
@@ -1049,6 +1064,9 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				client_secret: SecretString::new("client-secret".into()),
 				redirect_uri: "http://localhost:3000/oauth/callback".into(),
 				scopes: vec![],
+				end_session_endpoint: None,
+				logout_path: None,
+				post_logout_redirect_uri: None,
 			},
 			"tokenEndpointAuth must be omitted unless authorizationEndpoint, tokenEndpoint, and jwks are configured explicitly",
 		),
@@ -1060,4 +1078,193 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 			.expect_err(name);
 		assert!(err.to_string().contains(expected_error_fragment), "{name}");
 	}
+}
+
+fn test_logout_policy() -> OidcPolicy {
+	let mut policy = test_policy();
+	policy.logout_path = Some("/oauth/logout".parse().expect("logout path"));
+	policy.post_logout_redirect_uri = "https://app.example.com/".into();
+	policy
+}
+
+fn encode_test_session(policy: &OidcPolicy) -> (String, String) {
+	let id_token = signed_id_token(TEST_NONCE);
+	let session = BrowserSession {
+		policy_id: policy.policy_id.clone(),
+		raw_id_token: SecretString::new(id_token.clone().into()),
+		expires_at_unix: Some(now_unix() + 300),
+	};
+	let encoded = policy
+		.session
+		.encode_browser_session(&session)
+		.expect("encode session");
+	(encoded, id_token)
+}
+
+#[tokio::test]
+async fn logout_with_end_session_endpoint_redirects_to_provider() {
+	let mut policy = test_logout_policy();
+	policy.end_session_endpoint =
+		Some(provider_endpoint("https://issuer.example.com/logout"));
+	let (encoded_session, id_token) = encode_test_session(&policy);
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/oauth/logout",
+		None,
+	);
+	add_cookie(
+		&mut req,
+		format!("{}={encoded_session}", policy.session.cookie_name),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("logout apply");
+	let response = response.direct_response.expect("redirect response");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+
+	let location = redirect_location(&response);
+	assert!(
+		location.starts_with("https://issuer.example.com/logout?"),
+		"should redirect to end_session_endpoint, got: {location}"
+	);
+	assert_eq!(query_param(&location, "client_id"), TEST_CLIENT_ID);
+	assert_eq!(
+		query_param(&location, "post_logout_redirect_uri"),
+		"https://app.example.com/"
+	);
+	assert_eq!(query_param(&location, "id_token_hint"), id_token);
+
+	let cookies: Vec<_> = response
+		.headers()
+		.get_all(header::SET_COOKIE)
+		.iter()
+		.map(|h| h.to_str().unwrap().to_string())
+		.collect();
+	assert!(cookies.iter().any(|cookie| {
+		cookie.starts_with(&policy.session.cookie_name) && cookie.contains("Max-Age=0")
+	}));
+}
+
+#[tokio::test]
+async fn logout_without_end_session_endpoint_redirects_to_post_logout_uri() {
+	let policy = test_logout_policy();
+	let (encoded_session, _) = encode_test_session(&policy);
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/oauth/logout",
+		None,
+	);
+	add_cookie(
+		&mut req,
+		format!("{}={encoded_session}", policy.session.cookie_name),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("logout apply");
+	let response = response.direct_response.expect("redirect response");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	assert_eq!(
+		redirect_location(&response),
+		"https://app.example.com/"
+	);
+
+	let cookies: Vec<_> = response
+		.headers()
+		.get_all(header::SET_COOKIE)
+		.iter()
+		.map(|h| h.to_str().unwrap().to_string())
+		.collect();
+	assert!(cookies.iter().any(|cookie| {
+		cookie.starts_with(&policy.session.cookie_name) && cookie.contains("Max-Age=0")
+	}));
+}
+
+#[tokio::test]
+async fn logout_without_session_cookie_still_redirects() {
+	let mut policy = test_logout_policy();
+	policy.end_session_endpoint =
+		Some(provider_endpoint("https://issuer.example.com/logout"));
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/oauth/logout",
+		None,
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("logout apply without session");
+	let response = response.direct_response.expect("redirect response");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+
+	let location = redirect_location(&response);
+	assert!(location.starts_with("https://issuer.example.com/logout?"));
+	assert_eq!(query_param(&location, "client_id"), TEST_CLIENT_ID);
+	assert!(
+		!location.contains("id_token_hint"),
+		"should not include id_token_hint when no session"
+	);
+
+	let cookies: Vec<_> = response
+		.headers()
+		.get_all(header::SET_COOKIE)
+		.iter()
+		.map(|h| h.to_str().unwrap().to_string())
+		.collect();
+	assert!(cookies.iter().any(|cookie| {
+		cookie.starts_with(&policy.session.cookie_name) && cookie.contains("Max-Age=0")
+	}));
+}
+
+#[tokio::test]
+async fn logout_path_not_matched_falls_through_to_normal_flow() {
+	let policy = test_logout_policy();
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/other/path",
+		Some("text/html"),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("non-logout path");
+	let response = response.direct_response.expect("redirect to login");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	let location = redirect_location(&response);
+	assert!(
+		location.starts_with("https://issuer.example.com/authorize?"),
+		"should redirect to login, got: {location}"
+	);
+}
+
+#[tokio::test]
+async fn post_to_logout_path_does_not_trigger_logout() {
+	let policy = test_logout_policy();
+
+	let mut req = request(
+		Method::POST,
+		"https://app.example.com/oauth/logout",
+		None,
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("POST to logout path");
+	let response = response.direct_response.expect("redirect to login");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	let location = redirect_location(&response);
+	assert!(
+		location.starts_with("https://issuer.example.com/authorize?"),
+		"POST should not trigger logout, got: {location}"
+	);
 }
