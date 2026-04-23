@@ -93,6 +93,14 @@ impl RedisProxyStore {
 		})
 	}
 
+	pub fn key_prefix(&self) -> &str {
+		&self.key_prefix
+	}
+
+	pub fn conn(&self) -> redis::aio::ConnectionManager {
+		self.conn.clone()
+	}
+
 	fn txn_key(&self, state: &str) -> String {
 		format!("{}:txn:{}", self.key_prefix, state)
 	}
@@ -316,7 +324,7 @@ pub(super) async fn proxy_authorize(
 		);
 	}
 
-	let registration = super::auth::get_registered_client(&client_id);
+	let registration = super::auth::get_registered_client(store, &client_id).await;
 	let registration = match registration {
 		Some(r) if r.active => r,
 		Some(_) => {
@@ -491,7 +499,7 @@ pub(super) async fn proxy_token(
 
 	let (client_id, client_secret) = extract_client_credentials(req, &form_params)?;
 
-	let registration = super::auth::get_registered_client(&client_id);
+	let registration = super::auth::get_registered_client(store, &client_id).await;
 	let registration = match registration {
 		Some(r) if r.active => r,
 		Some(_) => {
