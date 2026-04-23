@@ -206,9 +206,15 @@ impl App {
 
 		for (name, mcp_backend) in backends {
 			let backend_name = name.name.to_string();
-			match self.warm_single_backend(&pi, name, mcp_backend).await {
-				Ok(()) => info!(backend = %backend_name, "cache warmed"),
-				Err(e) => warn!(backend = %backend_name, error = %e, "cache warming failed, will warm on first request"),
+			match tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				self.warm_single_backend(&pi, name, mcp_backend),
+			)
+			.await
+			{
+				Ok(Ok(())) => info!(backend = %backend_name, "cache warmed"),
+				Ok(Err(e)) => warn!(backend = %backend_name, error = %e, "cache warming failed, will warm on first request"),
+				Err(_) => warn!(backend = %backend_name, "cache warming timed out after 10s, will warm on first request"),
 			}
 		}
 	}

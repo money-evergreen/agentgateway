@@ -119,9 +119,6 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	let pi = Arc::new(pi);
 	let gw = proxy::Gateway::new(pi.clone(), drain_rx.clone());
 
-	// Register a readiness task for MCP cache warming
-	let cache_warm_task = ready.register_task("mcp cache warming");
-
 	// Run the agentgateway in the data plane worker pool.
 	let mut xds_rx_for_proxy = xds_rx.clone();
 	data_plane_pool.send(DataPlaneTask {
@@ -135,14 +132,14 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		}),
 	})?;
 
-	// Warm MCP list caches after XDS is ready, then release the readiness gate
+	// Best-effort cache warming: runs after XDS is ready, does not block readiness.
+	// Backends that fail to warm will fill their cache on the first client request.
 	let mcp_state_for_warm = pi.mcp_state.clone();
 	let pi_for_warm = pi.clone();
 	let mut xds_rx_for_cache = xds_rx.clone();
 	tokio::spawn(async move {
 		let _ = xds_rx_for_cache.changed().await;
 		mcp_state_for_warm.warm_caches(pi_for_warm).await;
-		drop(cache_warm_task);
 	});
 
 	drop(proxy_task);
