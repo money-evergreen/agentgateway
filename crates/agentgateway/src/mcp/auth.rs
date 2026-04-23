@@ -4,10 +4,9 @@ use axum_core::response::IntoResponse;
 use bytes::Bytes;
 use http::Method;
 use http::uri::PathAndQuery;
-use once_cell::sync::Lazy;
+use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::http::jwt::Claims;
@@ -15,12 +14,11 @@ use crate::http::oauth::{authorization_server_metadata_url, openid_configuration
 use crate::http::*;
 use crate::json;
 use crate::json::from_body_with_limit;
+use crate::mcp::oidc_proxy::RedisProxyStore;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{McpAuthentication, McpIDP};
 
-static LOCAL_CLIENT_REGISTRY: Lazy<RwLock<LocalClientRegistry>> =
-	Lazy::new(|| RwLock::new(LocalClientRegistry::default()));
 
 /// RFC 7591 Dynamic Client Registration request.
 /// All standard metadata fields are accepted. Unknown extension fields are
@@ -91,9 +89,35 @@ pub(super) struct LocalClientRegistrationRecord {
 	software_version: Option<String>,
 }
 
-#[derive(Default)]
-struct LocalClientRegistry {
-	by_id: HashMap<String, LocalClientRegistrationRecord>,
+fn dcr_client_key(prefix: &str, client_id: &str) -> String {
+	format!("{prefix}:dcr:client:{client_id}")
+}
+
+fn dcr_clients_set_key(prefix: &str) -> String {
+	format!("{prefix}:dcr:clients")
+}
+
+async fn dcr_get(store: &RedisProxyStore, client_id: &str) -> Option<LocalClientRegistrationRecord> {
+	let key = dcr_client_key(store.key_prefix(), client_id);
+	let mut conn = store.conn();
+	let value: Option<String> = conn.get(&key).await.ok()?;
+	value.and_then(|json| serde_json::from_str(&json).ok())
+}
+
+async fn dcr_set(store: &RedisProxyStore, record: &LocalClientRegistrationRecord) -> Result<(), String> {
+	let key = dcr_client_key(store.key_prefix(), &record.client_id);
+	let idx_key = dcr_clients_set_key(store.key_prefix());
+	let value = serde_json::to_string(record)
+		.map_err(|e| format!("serialize DCR record: {e}"))?;
+	let mut conn = store.conn();
+	redis::pipe()
+		.atomic()
+		.cmd("SET").arg(&key).arg(&value)
+		.cmd("SADD").arg(&idx_key).arg(&record.client_id)
+		.exec_async(&mut conn)
+		.await
+		.map_err(|e| format!("Redis DCR set: {e}"))?;
+	Ok(())
 }
 
 fn is_loopback_host(host: Option<&str>) -> bool {
@@ -192,111 +216,132 @@ impl LocalClientRegistrationRequest {
 	}
 }
 
-impl LocalClientRegistry {
-	fn register(
-		&mut self,
-		issuer: &str,
-		request: LocalClientRegistrationRequest,
-	) -> Result<(LocalClientRegistrationRecord, bool), String> {
-		let request = request.validate_and_normalize()?;
-		let client_id = request.deterministic_client_id(issuer)?;
-		if let Some(existing) = self.by_id.get(&client_id) {
-			if !existing.active {
-				return Err("client registration exists but is deactivated".into());
-			}
-			return Ok((existing.clone(), false));
-		}
+fn build_new_record(
+	issuer: &str,
+	request: LocalClientRegistrationRequest,
+) -> Result<LocalClientRegistrationRecord, String> {
+	let request = request.validate_and_normalize()?;
+	let client_id = request.deterministic_client_id(issuer)?;
 
-		let mut hasher = Sha256::new();
-		hasher.update(client_id.as_bytes());
-		hasher.update(b":secret");
-		let digest = hasher.finalize();
-		let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-		let client_secret = format!("agw_secret_{}", &digest_hex[..32]);
+	let mut hasher = Sha256::new();
+	hasher.update(client_id.as_bytes());
+	hasher.update(b":secret");
+	let digest = hasher.finalize();
+	let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+	let client_secret = format!("agw_secret_{}", &digest_hex[..32]);
 
-		let record = LocalClientRegistrationRecord {
-			client_id: client_id.clone(),
-			client_secret,
-			active: true,
-			redirect_uris: request.redirect_uris,
-			client_name: request.client_name,
-			token_endpoint_auth_method: request
-				.token_endpoint_auth_method
-				.unwrap_or_else(|| "none".into()),
-			grant_types: request
-				.grant_types
-				.unwrap_or_else(|| vec!["authorization_code".into()]),
-			response_types: request.response_types.unwrap_or_else(|| vec!["code".into()]),
-			scope: request.scope,
-			client_uri: request.client_uri,
-			logo_uri: request.logo_uri,
-			contacts: request.contacts,
-			tos_uri: request.tos_uri,
-			policy_uri: request.policy_uri,
-			jwks_uri: request.jwks_uri,
-			software_id: request.software_id,
-			software_version: request.software_version,
-		};
-		self.by_id.insert(client_id, record.clone());
-		Ok((record, true))
-	}
-
-	fn get(&self, client_id: &str) -> Option<LocalClientRegistrationRecord> {
-		self.by_id.get(client_id).cloned()
-	}
-
-	fn update(
-		&mut self,
-		client_id: &str,
-		request: LocalClientRegistrationRequest,
-	) -> Result<LocalClientRegistrationRecord, String> {
-		let normalized = request.validate_and_normalize()?;
-		let existing = self
-			.by_id
-			.get_mut(client_id)
-			.ok_or_else(|| "unknown client_id".to_string())?;
-		if !existing.active {
-			return Err("client registration is deactivated".into());
-		}
-		existing.redirect_uris = normalized.redirect_uris;
-		existing.client_name = normalized.client_name;
-		existing.token_endpoint_auth_method = normalized
+	Ok(LocalClientRegistrationRecord {
+		client_id,
+		client_secret,
+		active: true,
+		redirect_uris: request.redirect_uris,
+		client_name: request.client_name,
+		token_endpoint_auth_method: request
 			.token_endpoint_auth_method
-			.unwrap_or_else(|| "none".into());
-		existing.grant_types = normalized
+			.unwrap_or_else(|| "none".into()),
+		grant_types: request
 			.grant_types
-			.unwrap_or_else(|| vec!["authorization_code".into()]);
-		existing.response_types = normalized.response_types.unwrap_or_else(|| vec!["code".into()]);
-		existing.scope = normalized.scope;
-		existing.client_uri = normalized.client_uri;
-		existing.logo_uri = normalized.logo_uri;
-		existing.contacts = normalized.contacts;
-		existing.tos_uri = normalized.tos_uri;
-		existing.policy_uri = normalized.policy_uri;
-		existing.jwks_uri = normalized.jwks_uri;
-		existing.software_id = normalized.software_id;
-		existing.software_version = normalized.software_version;
-		Ok(existing.clone())
-	}
-
-	fn deactivate(&mut self, client_id: &str) -> Result<LocalClientRegistrationRecord, String> {
-		let existing = self
-			.by_id
-			.get_mut(client_id)
-			.ok_or_else(|| "unknown client_id".to_string())?;
-		if !existing.active {
-			return Err("client registration is already deactivated".into());
-		}
-		existing.active = false;
-		Ok(existing.clone())
-	}
+			.unwrap_or_else(|| vec!["authorization_code".into()]),
+		response_types: request.response_types.unwrap_or_else(|| vec!["code".into()]),
+		scope: request.scope,
+		client_uri: request.client_uri,
+		logo_uri: request.logo_uri,
+		contacts: request.contacts,
+		tos_uri: request.tos_uri,
+		policy_uri: request.policy_uri,
+		jwks_uri: request.jwks_uri,
+		software_id: request.software_id,
+		software_version: request.software_version,
+	})
 }
 
-pub(super) fn get_registered_client(client_id: &str) -> Option<LocalClientRegistrationRecord> {
-	LOCAL_CLIENT_REGISTRY
-		.read()
-		.ok()
-		.and_then(|registry| registry.get(client_id))
+fn apply_update(
+	existing: &mut LocalClientRegistrationRecord,
+	request: LocalClientRegistrationRequest,
+) -> Result<(), String> {
+	let normalized = request.validate_and_normalize()?;
+	if !existing.active {
+		return Err("client registration is deactivated".into());
+	}
+	existing.redirect_uris = normalized.redirect_uris;
+	existing.client_name = normalized.client_name;
+	existing.token_endpoint_auth_method = normalized
+		.token_endpoint_auth_method
+		.unwrap_or_else(|| "none".into());
+	existing.grant_types = normalized
+		.grant_types
+		.unwrap_or_else(|| vec!["authorization_code".into()]);
+	existing.response_types = normalized.response_types.unwrap_or_else(|| vec!["code".into()]);
+	existing.scope = normalized.scope;
+	existing.client_uri = normalized.client_uri;
+	existing.logo_uri = normalized.logo_uri;
+	existing.contacts = normalized.contacts;
+	existing.tos_uri = normalized.tos_uri;
+	existing.policy_uri = normalized.policy_uri;
+	existing.jwks_uri = normalized.jwks_uri;
+	existing.software_id = normalized.software_id;
+	existing.software_version = normalized.software_version;
+	Ok(())
+}
+
+async fn dcr_register(
+	store: &RedisProxyStore,
+	issuer: &str,
+	request: LocalClientRegistrationRequest,
+) -> Result<(LocalClientRegistrationRecord, bool), String> {
+	let record = build_new_record(issuer, request)?;
+	if let Some(existing) = dcr_get(store, &record.client_id).await {
+		if !existing.active {
+			return Err("client registration exists but is deactivated".into());
+		}
+		return Ok((existing, false));
+	}
+	dcr_set(store, &record).await?;
+	Ok((record, true))
+}
+
+async fn dcr_update(
+	store: &RedisProxyStore,
+	client_id: &str,
+	request: LocalClientRegistrationRequest,
+) -> Result<LocalClientRegistrationRecord, String> {
+	let mut existing = dcr_get(store, client_id)
+		.await
+		.ok_or_else(|| "unknown client_id".to_string())?;
+	apply_update(&mut existing, request)?;
+	dcr_set(store, &existing).await?;
+	Ok(existing)
+}
+
+async fn dcr_deactivate(
+	store: &RedisProxyStore,
+	client_id: &str,
+) -> Result<LocalClientRegistrationRecord, String> {
+	let mut existing = dcr_get(store, client_id)
+		.await
+		.ok_or_else(|| "unknown client_id".to_string())?;
+	if !existing.active {
+		return Err("client registration is already deactivated".into());
+	}
+	existing.active = false;
+	dcr_set(store, &existing).await?;
+	Ok(existing)
+}
+
+pub(super) async fn get_registered_client(
+	store: &RedisProxyStore,
+	client_id: &str,
+) -> Option<LocalClientRegistrationRecord> {
+	dcr_get(store, client_id).await
+}
+
+fn get_dcr_store(auth: &McpAuthentication) -> Result<&RedisProxyStore, ProxyError> {
+	auth.oidc_proxy
+		.as_ref()
+		.map(|p| p.store.as_ref())
+		.ok_or_else(|| {
+			ProxyError::ProcessingString("DCR requires oidcProxy with Redis storage".into())
+		})
 }
 
 pub(crate) fn is_well_known_endpoint(path: &str) -> bool {
@@ -755,6 +800,7 @@ pub(super) async fn client_registration(
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
 	let _ = client;
+	let store = get_dcr_store(auth)?;
 	let path = req.uri().path().to_string();
 	let Some((_, suffix)) = path.split_once("/client-registration") else {
 		return build_json_response(
@@ -785,38 +831,34 @@ pub(super) async fn client_registration(
 					);
 				},
 			};
-		let (record, created) = match LOCAL_CLIENT_REGISTRY
-			.write()
-			.map_err(|_| "local registry lock poisoned".to_string())
-			.and_then(|mut reg| reg.register(&auth.issuer, request))
-		{
-			Ok(result) => result,
-			Err(e) => {
-				return build_json_response(
-					StatusCode::BAD_REQUEST,
-					serde_json::json!({
-						"error": "invalid_client_metadata",
-						"error_description": e
-					}),
+			let (record, created) = match dcr_register(store, &auth.issuer, request).await {
+				Ok(result) => result,
+				Err(e) => {
+					return build_json_response(
+						StatusCode::BAD_REQUEST,
+						serde_json::json!({
+							"error": "invalid_client_metadata",
+							"error_description": e
+						}),
+					);
+				},
+			};
+			let status = if created {
+				info!(
+					client_id = %record.client_id,
+					audit_event = "client_registered",
+					"new MCP client registration created (Redis-backed)"
 				);
-			},
-		};
-		let status = if created {
-			info!(
-				client_id = %record.client_id,
-				audit_event = "client_registered",
-				"new MCP client registration created"
-			);
-			StatusCode::CREATED
-		} else {
-			debug!(
-				client_id = %record.client_id,
-				audit_event = "client_registration_idempotent",
-				"MCP client registration already exists"
-			);
-			StatusCode::OK
-		};
-		build_json_response(status, serde_json::to_value(record).unwrap_or_default())
+				StatusCode::CREATED
+			} else {
+				debug!(
+					client_id = %record.client_id,
+					audit_event = "client_registration_idempotent",
+					"MCP client registration already exists"
+				);
+				StatusCode::OK
+			};
+			build_json_response(status, serde_json::to_value(record).unwrap_or_default())
 		},
 		Method::GET => {
 			if client_id.is_empty() {
@@ -825,10 +867,7 @@ pub(super) async fn client_registration(
 					serde_json::json!({ "error": "client_id path segment is required for GET" }),
 				);
 			}
-			let registry = LOCAL_CLIENT_REGISTRY
-				.read()
-				.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?;
-			match registry.get(client_id) {
+			match dcr_get(store, client_id).await {
 				Some(record) if record.active => {
 					build_json_response(StatusCode::OK, serde_json::to_value(record).unwrap_or_default())
 				},
@@ -849,74 +888,64 @@ pub(super) async fn client_registration(
 					serde_json::json!({ "error": "client_id path segment is required for update" }),
 				);
 			}
-		let request: LocalClientRegistrationRequest = match serde_json::from_value(body) {
-			Ok(r) => r,
-			Err(e) => {
-				return build_json_response(
-					StatusCode::BAD_REQUEST,
-					serde_json::json!({
-						"error": "invalid_client_metadata",
-						"error_description": format!("invalid registration payload: {e}")
-					}),
-				);
-			},
-		};
-		let updated = match LOCAL_CLIENT_REGISTRY
-			.write()
-			.map_err(|_| "local registry lock poisoned".to_string())
-			.and_then(|mut reg| reg.update(client_id, request))
-		{
-			Ok(result) => result,
-			Err(e) => {
-				return build_json_response(
-					StatusCode::BAD_REQUEST,
-					serde_json::json!({
-						"error": "invalid_client_metadata",
-						"error_description": e
-					}),
-				);
-			},
-		};
-		info!(
-			client_id = %updated.client_id,
-			audit_event = "client_updated",
-			"MCP client registration updated"
-		);
-		build_json_response(StatusCode::OK, serde_json::to_value(updated).unwrap_or_default())
+			let request: LocalClientRegistrationRequest = match serde_json::from_value(body) {
+				Ok(r) => r,
+				Err(e) => {
+					return build_json_response(
+						StatusCode::BAD_REQUEST,
+						serde_json::json!({
+							"error": "invalid_client_metadata",
+							"error_description": format!("invalid registration payload: {e}")
+						}),
+					);
+				},
+			};
+			let updated = match dcr_update(store, client_id, request).await {
+				Ok(result) => result,
+				Err(e) => {
+					return build_json_response(
+						StatusCode::BAD_REQUEST,
+						serde_json::json!({
+							"error": "invalid_client_metadata",
+							"error_description": e
+						}),
+					);
+				},
+			};
+			info!(
+				client_id = %updated.client_id,
+				audit_event = "client_updated",
+				"MCP client registration updated"
+			);
+			build_json_response(StatusCode::OK, serde_json::to_value(updated).unwrap_or_default())
 		},
 		Method::DELETE => {
-		if client_id.is_empty() {
-			return build_json_response(
-				StatusCode::BAD_REQUEST,
-				serde_json::json!({ "error": "client_id path segment is required for delete" }),
+			if client_id.is_empty() {
+				return build_json_response(
+					StatusCode::BAD_REQUEST,
+					serde_json::json!({ "error": "client_id path segment is required for delete" }),
+				);
+			}
+			let deactivated = match dcr_deactivate(store, client_id).await {
+				Ok(r) => r,
+				Err(e) => return Err(ProxyError::ProcessingString(e)),
+			};
+			let revoked = super::oidc_proxy::revoke_client(store, &deactivated.client_id).await;
+			info!(
+				client_id = %deactivated.client_id,
+				transactions_revoked = revoked.0,
+				auth_codes_revoked = revoked.1,
+				audit_event = "client_deactivated",
+				"MCP client deactivated; pending auth state purged"
 			);
-		}
-		let deactivated = LOCAL_CLIENT_REGISTRY
-			.write()
-			.map_err(|_| ProxyError::ProcessingString("local registry lock poisoned".into()))?
-			.deactivate(client_id)
-			.map_err(ProxyError::ProcessingString)?;
-		let revoked = match &auth.oidc_proxy {
-			Some(proxy) => {
-				super::oidc_proxy::revoke_client(&proxy.store, &deactivated.client_id).await
-			},
-			None => (0, 0),
-		};
-		info!(
-			client_id = %deactivated.client_id,
-			transactions_revoked = revoked.0,
-			auth_codes_revoked = revoked.1,
-			audit_event = "client_deactivated",
-			"MCP client deactivated; pending auth state purged"
-		);
-		build_json_response(
-			StatusCode::OK,
-			serde_json::json!({
-				"client_id": deactivated.client_id,
-				"active": deactivated.active
-			}),
-		)
-	},
+			build_json_response(
+				StatusCode::OK,
+				serde_json::json!({
+					"client_id": deactivated.client_id,
+					"active": deactivated.active
+				}),
+			)
+		},
 		_ => build_json_response(
 			StatusCode::METHOD_NOT_ALLOWED,
 			serde_json::json!({ "error": "method not allowed for client-registration endpoint" }),
@@ -954,21 +983,18 @@ mod tests {
 	}
 
 	#[test]
-	fn deterministic_registration_is_idempotent() {
-		let mut registry = LocalClientRegistry::default();
+	fn deterministic_registration_produces_same_id() {
 		let issuer = "https://issuer.example";
-		let (first, created_first) = registry.register(issuer, sample_request()).expect("register");
-		let (second, created_second) = registry.register(issuer, sample_request()).expect("register");
-		assert!(created_first);
-		assert!(!created_second);
+		let first = build_new_record(issuer, sample_request()).expect("build");
+		let second = build_new_record(issuer, sample_request()).expect("build");
 		assert_eq!(first.client_id, second.client_id);
+		assert_eq!(first.client_secret, second.client_secret);
 	}
 
 	#[test]
-	fn update_and_deactivate_lifecycle_is_enforced() {
-		let mut registry = LocalClientRegistry::default();
+	fn update_lifecycle_is_enforced() {
 		let issuer = "https://issuer.example";
-		let (record, _) = registry.register(issuer, sample_request()).expect("register");
+		let mut record = build_new_record(issuer, sample_request()).expect("build");
 
 		let update_request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://updated.example/callback"],
@@ -979,38 +1005,27 @@ mod tests {
 			"scope": "openid email"
 		}))
 		.expect("parse update");
-		let updated = registry
-			.update(&record.client_id, update_request)
-			.expect("update");
-		assert_eq!(updated.client_name.as_deref(), Some("updated"));
-		assert_eq!(updated.token_endpoint_auth_method, "client_secret_post");
+		apply_update(&mut record, update_request).expect("update");
+		assert_eq!(record.client_name.as_deref(), Some("updated"));
+		assert_eq!(record.token_endpoint_auth_method, "client_secret_post");
 
-		let deactivated = registry.deactivate(&record.client_id).expect("deactivate");
-		assert!(!deactivated.active);
-		assert!(registry.update(&record.client_id, sample_request()).is_err());
+		record.active = false;
+		assert!(apply_update(&mut record, sample_request()).is_err());
 	}
 
 	#[test]
-	fn deactivated_client_blocks_re_registration_and_update() {
-		let mut registry = LocalClientRegistry::default();
+	fn deactivated_client_blocks_update() {
 		let issuer = "https://issuer.example";
-		let (record, _) = registry.register(issuer, sample_request()).expect("register");
-		registry.deactivate(&record.client_id).expect("deactivate");
+		let mut record = build_new_record(issuer, sample_request()).expect("build");
+		record.active = false;
 
-		let err = registry
-			.register(issuer, sample_request())
-			.expect_err("re-registration after deactivation must fail");
-		assert!(err.contains("deactivated"));
-
-		let err = registry
-			.update(&record.client_id, sample_request())
+		let err = apply_update(&mut record, sample_request())
 			.expect_err("update after deactivation must fail");
 		assert!(err.contains("deactivated"));
 	}
 
 	#[test]
 	fn malformed_or_unsupported_metadata_is_rejected() {
-		let mut registry = LocalClientRegistry::default();
 		let request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["not-a-uri"],
 			"token_endpoint_auth_method": "private_key_jwt",
@@ -1018,8 +1033,7 @@ mod tests {
 			"response_types": ["token"]
 		}))
 		.expect("parse");
-		let err = registry
-			.register("https://issuer.example", request)
+		let err = build_new_record("https://issuer.example", request)
 			.expect_err("invalid metadata should fail");
 		assert!(err.contains("redirect_uris") || err.contains("token_endpoint_auth_method"));
 	}
@@ -1233,7 +1247,6 @@ mod tests {
 
 	#[test]
 	fn rfc7591_registration_stores_and_returns_metadata() {
-		let mut registry = LocalClientRegistry::default();
 		let request: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://app.example/callback"],
 			"client_name": "with-metadata",
@@ -1246,8 +1259,7 @@ mod tests {
 			"contacts": ["a@b.com", "c@d.com"]
 		}))
 		.expect("parse");
-		let (record, created) = registry.register("https://issuer.example", request).expect("register");
-		assert!(created);
+		let record = build_new_record("https://issuer.example", request).expect("build");
 		assert_eq!(record.logo_uri.as_deref(), Some("https://example.com/logo.png"));
 		assert_eq!(record.software_version.as_deref(), Some("2.0.0"));
 		assert_eq!(record.contacts.as_ref().map(|c| c.len()), Some(2));
@@ -1350,12 +1362,11 @@ mod tests {
 
 	#[test]
 	fn dcr_response_omits_scope_when_absent() {
-		let mut registry = LocalClientRegistry::default();
 		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://app.example/cb"]
 		}))
 		.expect("parse");
-		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let record = build_new_record("https://issuer.example", req).expect("build");
 		let json = serde_json::to_value(&record).expect("serialize");
 		assert!(json.get("scope").is_none(), "scope must be omitted, not null");
 		assert!(json.get("client_name").is_none(), "client_name must be omitted, not null");
@@ -1363,13 +1374,12 @@ mod tests {
 
 	#[test]
 	fn dcr_response_includes_scope_when_provided() {
-		let mut registry = LocalClientRegistry::default();
 		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://app.example/cb"],
 			"scope": "openid profile"
 		}))
 		.expect("parse");
-		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let record = build_new_record("https://issuer.example", req).expect("build");
 		let json = serde_json::to_value(&record).expect("serialize");
 		assert_eq!(json["scope"], "openid profile");
 	}
@@ -1405,12 +1415,11 @@ mod tests {
 
 	#[test]
 	fn registration_without_auth_method_defaults_to_none() {
-		let mut registry = LocalClientRegistry::default();
 		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://app.example/cb"]
 		}))
 		.expect("parse");
-		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let record = build_new_record("https://issuer.example", req).expect("build");
 		assert_eq!(
 			record.token_endpoint_auth_method, "none",
 			"absent token_endpoint_auth_method must default to none for public/native clients"
@@ -1419,13 +1428,22 @@ mod tests {
 
 	#[test]
 	fn registration_with_explicit_basic_stays_basic() {
-		let mut registry = LocalClientRegistry::default();
 		let req: LocalClientRegistrationRequest = serde_json::from_value(serde_json::json!({
 			"redirect_uris": ["https://app.example/cb"],
 			"token_endpoint_auth_method": "client_secret_basic"
 		}))
 		.expect("parse");
-		let (record, _) = registry.register("https://issuer.example", req).expect("register");
+		let record = build_new_record("https://issuer.example", req).expect("build");
 		assert_eq!(record.token_endpoint_auth_method, "client_secret_basic");
+	}
+
+	#[test]
+	fn dcr_redis_key_format_matches_spec() {
+		let prefix = "agw:oidc:dev";
+		assert_eq!(
+			dcr_client_key(prefix, "agw_abc123"),
+			"agw:oidc:dev:dcr:client:agw_abc123"
+		);
+		assert_eq!(dcr_clients_set_key(prefix), "agw:oidc:dev:dcr:clients");
 	}
 }
