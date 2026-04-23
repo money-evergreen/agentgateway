@@ -23,6 +23,8 @@ struct OidcDiscoveryDocument {
 	jwks_uri: String,
 	#[serde(default)]
 	token_endpoint_auth_methods_supported: Option<Vec<String>>,
+	#[serde(default)]
+	end_session_endpoint: Option<String>,
 }
 
 struct PreparedOidcProvider {
@@ -31,6 +33,7 @@ struct PreparedOidcProvider {
 	token_endpoint: ProviderEndpoint,
 	token_endpoint_auth: TokenEndpointAuth,
 	id_token_jwks: JwkSet,
+	end_session_endpoint: Option<ProviderEndpoint>,
 }
 
 struct PreparedOidcPolicy {
@@ -39,6 +42,8 @@ struct PreparedOidcPolicy {
 	client_secret: SecretString,
 	redirect_uri: RedirectUri,
 	scopes: Vec<String>,
+	logout_path: Option<String>,
+	post_logout_redirect_uri: Option<String>,
 }
 
 /// Browser-based OIDC authentication policy.
@@ -94,6 +99,22 @@ pub struct LocalOidcConfig {
 	/// Additional OAuth2 scopes to request. `openid` is always included.
 	#[serde(default)]
 	pub scopes: Vec<String>,
+
+	/// Provider's end-session endpoint for RP-Initiated Logout.
+	/// Discovered automatically; set explicitly only when using explicit provider config.
+	#[serde(default)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub end_session_endpoint: Option<ProviderEndpoint>,
+
+	/// Path that triggers logout. Defaults to deriving from redirectURI
+	/// (e.g. redirectURI "/ui/oauth/callback" → logout path "/ui/logout").
+	#[serde(default)]
+	pub logout_path: Option<String>,
+
+	/// Where to redirect after the provider clears its session.
+	/// If omitted, defaults to "/".
+	#[serde(default, rename = "postLogoutRedirectURI")]
+	pub post_logout_redirect_uri: Option<String>,
 }
 
 struct DiscoveredProviderMetadata {
@@ -101,6 +122,7 @@ struct DiscoveredProviderMetadata {
 	token_endpoint: ProviderEndpoint,
 	token_endpoint_auth: TokenEndpointAuth,
 	jwks: FileInlineOrRemote,
+	end_session_endpoint: Option<ProviderEndpoint>,
 }
 
 impl LocalOidcConfig {
@@ -128,6 +150,9 @@ impl LocalOidcConfig {
 			client_secret,
 			redirect_uri,
 			scopes,
+			end_session_endpoint,
+			logout_path,
+			post_logout_redirect_uri,
 		} = self;
 		let redirect_uri = RedirectUri::parse(redirect_uri)?;
 		let explicit_field_count = usize::from(authorization_endpoint.is_some())
@@ -155,6 +180,8 @@ impl LocalOidcConfig {
 					token_endpoint: discovered.token_endpoint,
 					token_endpoint_auth: discovered.token_endpoint_auth,
 					id_token_jwks,
+					end_session_endpoint: end_session_endpoint
+						.or(discovered.end_session_endpoint),
 				}
 			},
 			3 => {
@@ -163,7 +190,7 @@ impl LocalOidcConfig {
 						"oidc discovery must be omitted when authorizationEndpoint, tokenEndpoint, and jwks are configured explicitly".into(),
 					));
 				}
-				resolve_explicit_provider(
+				let mut provider = resolve_explicit_provider(
 					client,
 					issuer,
 					authorization_endpoint.expect("checked above"),
@@ -171,7 +198,9 @@ impl LocalOidcConfig {
 					token_endpoint_auth.unwrap_or_default(),
 					jwks.expect("checked above"),
 				)
-				.await?
+				.await?;
+				provider.end_session_endpoint = end_session_endpoint;
+				provider
 			},
 			_ => {
 				return Err(Error::Config(
@@ -187,6 +216,8 @@ impl LocalOidcConfig {
 			client_secret,
 			redirect_uri,
 			scopes,
+			logout_path,
+			post_logout_redirect_uri,
 		})
 	}
 }
@@ -221,6 +252,13 @@ async fn discover_provider_metadata(
 			.parse()
 			.map_err(|e| Error::Config(format!("invalid jwks uri: {e}")))?,
 	};
+	let end_session_endpoint = document
+		.end_session_endpoint
+		.map(|ep| {
+			ep.parse()
+				.map_err(|e| Error::Config(format!("invalid end_session_endpoint: {e}")))
+		})
+		.transpose()?;
 	Ok(DiscoveredProviderMetadata {
 		authorization_endpoint: document
 			.authorization_endpoint
@@ -232,6 +270,7 @@ async fn discover_provider_metadata(
 			.map_err(|e| Error::Config(format!("invalid token endpoint: {e}")))?,
 		token_endpoint_auth,
 		jwks,
+		end_session_endpoint,
 	})
 }
 
@@ -251,6 +290,7 @@ async fn resolve_explicit_provider(
 		token_endpoint,
 		token_endpoint_auth,
 		id_token_jwks,
+		end_session_endpoint: None,
 	})
 }
 
@@ -314,10 +354,26 @@ impl PreparedOidcPolicy {
 			client_secret,
 			redirect_uri,
 			scopes,
+			logout_path,
+			post_logout_redirect_uri,
 		} = self;
 		let scopes = dedupe_scopes(scopes);
+		let end_session_endpoint = provider.end_session_endpoint.clone();
 		let token_endpoint_auth = provider.token_endpoint_auth;
 		let provider = Arc::new(provider.compile(client_id.clone())?);
+
+		let logout_path = match logout_path {
+			Some(explicit) => {
+				let parsed = explicit
+					.parse::<http::uri::PathAndQuery>()
+					.map_err(|e| Error::Config(format!("invalid logoutPath: {e}")))?;
+				Some(parsed)
+			},
+			None => derive_logout_path(&redirect_uri),
+		};
+
+		let post_logout_redirect_uri =
+			post_logout_redirect_uri.unwrap_or_else(|| "/".into());
 
 		Ok(OidcPolicy {
 			policy_id,
@@ -338,8 +394,25 @@ impl PreparedOidcPolicy {
 				encoder: oidc_cookie_encoder.clone(),
 			},
 			scopes,
+			end_session_endpoint,
+			logout_path,
+			post_logout_redirect_uri,
 		})
 	}
+}
+
+/// Derive a default logout path from the redirect URI.
+/// Given a callback path like `/ui/oauth/callback`, extracts the first path segment
+/// and appends `/logout` (e.g. `/ui/logout`).
+fn derive_logout_path(redirect_uri: &RedirectUri) -> Option<http::uri::PathAndQuery> {
+	let path = redirect_uri.callback_path.path();
+	let first_segment = path
+		.trim_start_matches('/')
+		.split('/')
+		.next()
+		.filter(|s| !s.is_empty())?;
+	let logout = format!("/{first_segment}/logout");
+	logout.parse().ok()
 }
 
 fn describe_file_inline_or_remote(source: &FileInlineOrRemote) -> String {
