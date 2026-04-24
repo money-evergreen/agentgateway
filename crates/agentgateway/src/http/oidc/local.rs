@@ -44,6 +44,7 @@ struct PreparedOidcPolicy {
 	scopes: Vec<String>,
 	logout_path: Option<String>,
 	post_logout_redirect_uri: Option<String>,
+	login_page: Option<String>,
 }
 
 /// Browser-based OIDC authentication policy.
@@ -115,6 +116,12 @@ pub struct LocalOidcConfig {
 	/// If omitted, defaults to "/".
 	#[serde(default, rename = "postLogoutRedirectURI")]
 	pub post_logout_redirect_uri: Option<String>,
+
+	/// Optional HTML page served to unauthenticated users instead of immediately
+	/// redirecting to the provider. The page should contain a link or button that
+	/// navigates to any OIDC-protected path to trigger the login redirect.
+	#[serde(default)]
+	pub login_page: Option<String>,
 }
 
 struct DiscoveredProviderMetadata {
@@ -153,6 +160,7 @@ impl LocalOidcConfig {
 			end_session_endpoint,
 			logout_path,
 			post_logout_redirect_uri,
+			login_page,
 		} = self;
 		let redirect_uri = RedirectUri::parse(redirect_uri)?;
 		let explicit_field_count = usize::from(authorization_endpoint.is_some())
@@ -218,6 +226,7 @@ impl LocalOidcConfig {
 			scopes,
 			logout_path,
 			post_logout_redirect_uri,
+			login_page,
 		})
 	}
 }
@@ -356,6 +365,7 @@ impl PreparedOidcPolicy {
 			scopes,
 			logout_path,
 			post_logout_redirect_uri,
+			login_page,
 		} = self;
 		let scopes = dedupe_scopes(scopes);
 		let end_session_endpoint = provider.end_session_endpoint.clone();
@@ -397,6 +407,7 @@ impl PreparedOidcPolicy {
 			end_session_endpoint,
 			logout_path,
 			post_logout_redirect_uri,
+			login_page,
 		})
 	}
 }

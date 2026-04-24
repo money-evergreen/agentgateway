@@ -132,6 +132,7 @@ fn test_policy() -> OidcPolicy {
 		end_session_endpoint: None,
 		logout_path: None,
 		post_logout_redirect_uri: "/".into(),
+		login_page: None,
 	}
 }
 
@@ -246,6 +247,7 @@ fn explicit_local_oidc_config() -> LocalOidcConfig {
 		end_session_endpoint: None,
 		logout_path: None,
 		post_logout_redirect_uri: None,
+		login_page: None,
 	}
 }
 
@@ -929,6 +931,7 @@ async fn local_oidc_config_compiles_supported_provider_sources() {
 				end_session_endpoint: None,
 				logout_path: None,
 				post_logout_redirect_uri: None,
+				login_page: None,
 			},
 			provider_endpoint(format!("{}/authorize", mock.uri())),
 			provider_endpoint(format!("{}/token", mock.uri())),
@@ -1009,6 +1012,7 @@ async fn discovery_rejects_relative_provider_endpoints() {
 		end_session_endpoint: None,
 		logout_path: None,
 		post_logout_redirect_uri: None,
+		login_page: None,
 	};
 	let err = compile_local_policy(policy, translated_policy_id("discovery-relative-endpoints"))
 		.await
@@ -1036,6 +1040,7 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				end_session_endpoint: None,
 				logout_path: None,
 				post_logout_redirect_uri: None,
+				login_page: None,
 			},
 			"authorizationEndpoint, tokenEndpoint, and jwks must either all be set or all be omitted",
 		),
@@ -1067,6 +1072,7 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				end_session_endpoint: None,
 				logout_path: None,
 				post_logout_redirect_uri: None,
+				login_page: None,
 			},
 			"tokenEndpointAuth must be omitted unless authorizationEndpoint, tokenEndpoint, and jwks are configured explicitly",
 		),
@@ -1266,5 +1272,175 @@ async fn post_to_logout_path_does_not_trigger_logout() {
 	assert!(
 		location.starts_with("https://issuer.example.com/authorize?"),
 		"POST should not trigger logout, got: {location}"
+	);
+}
+
+const TEST_LOGIN_PAGE_HTML: &str =
+	"<html><body><h1>Sign In</h1><a href=\"/ui\">Login</a></body></html>";
+
+#[tokio::test]
+async fn login_page_served_to_unauthenticated_requests() {
+	let mut policy = test_policy();
+	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/protected",
+		Some("text/html"),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("login page apply");
+	let response = response.direct_response.expect("login page response");
+	assert_eq!(response.status(), ::http::StatusCode::OK);
+	assert_eq!(
+		response
+			.headers()
+			.get(header::CONTENT_TYPE)
+			.unwrap()
+			.to_str()
+			.unwrap(),
+		"text/html; charset=utf-8"
+	);
+	assert_eq!(
+		response
+			.headers()
+			.get(header::CACHE_CONTROL)
+			.unwrap()
+			.to_str()
+			.unwrap(),
+		"no-store"
+	);
+	assert!(response.headers().get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn login_page_not_shown_to_authenticated_requests() {
+	let mut policy = test_policy();
+	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+
+	let id_token = signed_id_token(TEST_NONCE);
+	let encoded = policy
+		.session
+		.encode_browser_session(&BrowserSession {
+			policy_id: policy.policy_id.clone(),
+			raw_id_token: SecretString::new(id_token.into()),
+			expires_at_unix: Some(now_unix() + 300),
+		})
+		.expect("encode session");
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/protected",
+		Some("text/html"),
+	);
+	add_cookie(
+		&mut req,
+		format!("{}={encoded}", policy.session.cookie_name),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("authenticated with login page configured");
+	assert!(
+		response.direct_response.is_none(),
+		"authenticated requests should pass through, not see login page"
+	);
+}
+
+#[tokio::test]
+async fn login_page_not_configured_preserves_redirect_behavior() {
+	let policy = test_policy();
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/protected",
+		Some("text/html"),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("no login page configured");
+	let response = response.direct_response.expect("redirect response");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	let location = redirect_location(&response);
+	assert!(
+		location.starts_with("https://issuer.example.com/authorize?"),
+		"should redirect to provider when no login page, got: {location}"
+	);
+}
+
+#[tokio::test]
+async fn login_page_does_not_intercept_callback() {
+	let mock = MockServer::start().await;
+	let id_token = signed_id_token(TEST_NONCE);
+	Mock::given(method("POST"))
+		.and(path("/token"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"id_token": id_token
+		})))
+		.mount(&mock)
+		.await;
+
+	let mut policy = test_callback_policy(provider_endpoint(format!("{}/token", mock.uri())));
+	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+
+	let transaction_id = "tx-1";
+	let callback_state = encoded_callback_state(transaction_id, "test-state");
+	let encoded = encoded_transaction(
+		&policy,
+		transaction_id,
+		"test-state",
+		TEST_NONCE,
+		"/protected",
+		now_unix() + 300,
+	);
+	let uri =
+		format!("https://app.example.com/oauth/callback?code=auth-code&state={callback_state}");
+	let mut req = request(Method::GET, &uri, Some("text/html"));
+	add_cookie(
+		&mut req,
+		format!(
+			"{}={encoded}",
+			policy.session.transaction_cookie_name(transaction_id)
+		),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("callback with login page configured");
+	let response = response.direct_response.expect("callback redirect");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	assert_eq!(
+		response.headers().get(header::LOCATION).unwrap(),
+		"/protected"
+	);
+}
+
+#[tokio::test]
+async fn login_page_does_not_intercept_logout() {
+	let mut policy = test_logout_policy();
+	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/oauth/logout",
+		None,
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("logout with login page configured");
+	let response = response.direct_response.expect("logout redirect");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	assert_eq!(
+		redirect_location(&response),
+		"https://app.example.com/"
 	);
 }
