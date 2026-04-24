@@ -133,6 +133,7 @@ fn test_policy() -> OidcPolicy {
 		logout_path: None,
 		post_logout_redirect_uri: "/".into(),
 		login_page: None,
+		login_page_path: None,
 	}
 }
 
@@ -248,6 +249,7 @@ fn explicit_local_oidc_config() -> LocalOidcConfig {
 		logout_path: None,
 		post_logout_redirect_uri: None,
 		login_page: None,
+		login_page_path: None,
 	}
 }
 
@@ -932,6 +934,7 @@ async fn local_oidc_config_compiles_supported_provider_sources() {
 				logout_path: None,
 				post_logout_redirect_uri: None,
 				login_page: None,
+				login_page_path: None,
 			},
 			provider_endpoint(format!("{}/authorize", mock.uri())),
 			provider_endpoint(format!("{}/token", mock.uri())),
@@ -1013,6 +1016,7 @@ async fn discovery_rejects_relative_provider_endpoints() {
 		logout_path: None,
 		post_logout_redirect_uri: None,
 		login_page: None,
+		login_page_path: None,
 	};
 	let err = compile_local_policy(policy, translated_policy_id("discovery-relative-endpoints"))
 		.await
@@ -1041,6 +1045,7 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				logout_path: None,
 				post_logout_redirect_uri: None,
 				login_page: None,
+				login_page_path: None,
 			},
 			"authorizationEndpoint, tokenEndpoint, and jwks must either all be set or all be omitted",
 		),
@@ -1073,6 +1078,7 @@ async fn local_oidc_config_rejects_ambiguous_provider_source_configuration() {
 				logout_path: None,
 				post_logout_redirect_uri: None,
 				login_page: None,
+				login_page_path: None,
 			},
 			"tokenEndpointAuth must be omitted unless authorizationEndpoint, tokenEndpoint, and jwks are configured explicitly",
 		),
@@ -1278,15 +1284,21 @@ async fn post_to_logout_path_does_not_trigger_logout() {
 const TEST_LOGIN_PAGE_HTML: &str =
 	"<html><body><h1>Sign In</h1><a href=\"/ui\">Login</a></body></html>";
 
-#[tokio::test]
-async fn login_page_served_to_unauthenticated_requests() {
+fn test_login_page_policy() -> OidcPolicy {
 	let mut policy = test_policy();
 	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+	policy.login_page_path = Some("/signin".parse().expect("login page path"));
+	policy
+}
+
+#[tokio::test]
+async fn login_page_served_on_dedicated_path() {
+	let policy = test_login_page_policy();
 
 	let mut req = request(
 		Method::GET,
-		"https://app.example.com/protected",
-		Some("text/html"),
+		"https://app.example.com/signin",
+		None,
 	);
 
 	let response = policy
@@ -1317,9 +1329,8 @@ async fn login_page_served_to_unauthenticated_requests() {
 }
 
 #[tokio::test]
-async fn login_page_not_shown_to_authenticated_requests() {
-	let mut policy = test_policy();
-	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+async fn login_page_served_even_with_valid_session() {
+	let policy = test_login_page_policy();
 
 	let id_token = signed_id_token(TEST_NONCE);
 	let encoded = policy
@@ -1333,8 +1344,8 @@ async fn login_page_not_shown_to_authenticated_requests() {
 
 	let mut req = request(
 		Method::GET,
-		"https://app.example.com/protected",
-		Some("text/html"),
+		"https://app.example.com/signin",
+		None,
 	);
 	add_cookie(
 		&mut req,
@@ -1344,10 +1355,35 @@ async fn login_page_not_shown_to_authenticated_requests() {
 	let response = policy
 		.apply(None, &mut req, policy_client())
 		.await
-		.expect("authenticated with login page configured");
+		.expect("login page with session");
+	let response = response.direct_response.expect("login page response");
+	assert_eq!(
+		response.status(),
+		::http::StatusCode::OK,
+		"login page path is public, should serve even with valid session"
+	);
+}
+
+#[tokio::test]
+async fn protected_route_redirects_to_provider_when_login_page_configured() {
+	let policy = test_login_page_policy();
+
+	let mut req = request(
+		Method::GET,
+		"https://app.example.com/ui",
+		Some("text/html"),
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("protected route with login page");
+	let response = response.direct_response.expect("redirect response");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	let location = redirect_location(&response);
 	assert!(
-		response.direct_response.is_none(),
-		"authenticated requests should pass through, not see login page"
+		location.starts_with("https://issuer.example.com/authorize?"),
+		"protected route should redirect to provider, got: {location}"
 	);
 }
 
@@ -1388,6 +1424,7 @@ async fn login_page_does_not_intercept_callback() {
 
 	let mut policy = test_callback_policy(provider_endpoint(format!("{}/token", mock.uri())));
 	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+	policy.login_page_path = Some("/signin".parse().expect("login page path"));
 
 	let transaction_id = "tx-1";
 	let callback_state = encoded_callback_state(transaction_id, "test-state");
@@ -1426,6 +1463,7 @@ async fn login_page_does_not_intercept_callback() {
 async fn login_page_does_not_intercept_logout() {
 	let mut policy = test_logout_policy();
 	policy.login_page = Some(TEST_LOGIN_PAGE_HTML.into());
+	policy.login_page_path = Some("/signin".parse().expect("login page path"));
 
 	let mut req = request(
 		Method::GET,
@@ -1442,5 +1480,28 @@ async fn login_page_does_not_intercept_logout() {
 	assert_eq!(
 		redirect_location(&response),
 		"https://app.example.com/"
+	);
+}
+
+#[tokio::test]
+async fn post_to_login_page_path_does_not_serve_page() {
+	let policy = test_login_page_policy();
+
+	let mut req = request(
+		Method::POST,
+		"https://app.example.com/signin",
+		None,
+	);
+
+	let response = policy
+		.apply(None, &mut req, policy_client())
+		.await
+		.expect("POST to login page path");
+	let response = response.direct_response.expect("redirect to login");
+	assert_eq!(response.status(), ::http::StatusCode::FOUND);
+	let location = redirect_location(&response);
+	assert!(
+		location.starts_with("https://issuer.example.com/authorize?"),
+		"POST to login page path should not serve page, got: {location}"
 	);
 }

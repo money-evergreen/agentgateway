@@ -45,6 +45,7 @@ struct PreparedOidcPolicy {
 	logout_path: Option<String>,
 	post_logout_redirect_uri: Option<String>,
 	login_page: Option<String>,
+	login_page_path: Option<String>,
 }
 
 /// Browser-based OIDC authentication policy.
@@ -117,11 +118,16 @@ pub struct LocalOidcConfig {
 	#[serde(default, rename = "postLogoutRedirectURI")]
 	pub post_logout_redirect_uri: Option<String>,
 
-	/// Optional HTML page served to unauthenticated users instead of immediately
-	/// redirecting to the provider. The page should contain a link or button that
-	/// navigates to any OIDC-protected path to trigger the login redirect.
+	/// Optional HTML page served on a dedicated public path (see loginPagePath).
+	/// The page should contain a link or button that navigates to an
+	/// OIDC-protected path (e.g. /ui) to trigger the login redirect.
 	#[serde(default)]
 	pub login_page: Option<String>,
+
+	/// Path where the login page is served. Defaults to "/signin".
+	/// Only used when loginPage is configured.
+	#[serde(default)]
+	pub login_page_path: Option<String>,
 }
 
 struct DiscoveredProviderMetadata {
@@ -161,6 +167,7 @@ impl LocalOidcConfig {
 			logout_path,
 			post_logout_redirect_uri,
 			login_page,
+			login_page_path,
 		} = self;
 		let redirect_uri = RedirectUri::parse(redirect_uri)?;
 		let explicit_field_count = usize::from(authorization_endpoint.is_some())
@@ -227,6 +234,7 @@ impl LocalOidcConfig {
 			logout_path,
 			post_logout_redirect_uri,
 			login_page,
+			login_page_path,
 		})
 	}
 }
@@ -366,6 +374,7 @@ impl PreparedOidcPolicy {
 			logout_path,
 			post_logout_redirect_uri,
 			login_page,
+			login_page_path,
 		} = self;
 		let scopes = dedupe_scopes(scopes);
 		let end_session_endpoint = provider.end_session_endpoint.clone();
@@ -384,6 +393,17 @@ impl PreparedOidcPolicy {
 
 		let post_logout_redirect_uri =
 			post_logout_redirect_uri.unwrap_or_else(|| "/".into());
+
+		let login_page_path = match (&login_page, login_page_path) {
+			(Some(_), Some(explicit)) => {
+				let parsed = explicit
+					.parse::<http::uri::PathAndQuery>()
+					.map_err(|e| Error::Config(format!("invalid loginPagePath: {e}")))?;
+				Some(parsed)
+			},
+			(Some(_), None) => Some("/signin".parse().expect("default login page path")),
+			(None, _) => None,
+		};
 
 		Ok(OidcPolicy {
 			policy_id,
@@ -408,6 +428,7 @@ impl PreparedOidcPolicy {
 			logout_path,
 			post_logout_redirect_uri,
 			login_page,
+			login_page_path,
 		})
 	}
 }

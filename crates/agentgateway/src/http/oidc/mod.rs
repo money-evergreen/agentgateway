@@ -142,6 +142,11 @@ pub struct OidcPolicy {
 	pub post_logout_redirect_uri: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub login_page: Option<String>,
+	#[serde(
+		skip_serializing_if = "Option::is_none",
+		serialize_with = "ser_opt_path_and_query"
+	)]
+	pub login_page_path: Option<http::uri::PathAndQuery>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -221,6 +226,26 @@ impl OidcPolicy {
 			}
 		}
 
+		if let Some(ref login_page_path) = self.login_page_path {
+			if req.method() == ::http::Method::GET
+				&& req.uri().path() == login_page_path.path()
+			{
+				if let Some(ref html) = self.login_page {
+					let response = ::http::Response::builder()
+						.status(StatusCode::OK)
+						.header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+						.header(header::CACHE_CONTROL, "no-store")
+						.body(Body::from(html.clone()))
+						.map_err(|e| {
+							Error::Config(format!(
+								"failed to build login page response: {e}"
+							))
+						})?;
+					return Ok(PolicyResponse::default().with_response(response));
+				}
+			}
+		}
+
 		if is_cors_preflight(req) {
 			return Ok(PolicyResponse::default());
 		}
@@ -247,18 +272,6 @@ impl OidcPolicy {
 					debug!(error=%err, "failed to decode oidc browser session cookie");
 				},
 			}
-		}
-
-		if let Some(ref login_page_html) = self.login_page {
-			let response = ::http::Response::builder()
-				.status(StatusCode::OK)
-				.header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-				.header(header::CACHE_CONTROL, "no-store")
-				.body(Body::from(login_page_html.clone()))
-				.map_err(|e| {
-					Error::Config(format!("failed to build login page response: {e}"))
-				})?;
-			return Ok(PolicyResponse::default().with_response(response));
 		}
 
 		// OIDC is an interactive browser policy: unauthenticated non-callback requests enter login.

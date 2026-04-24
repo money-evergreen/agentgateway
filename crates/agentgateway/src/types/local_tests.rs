@@ -60,6 +60,7 @@ fn test_oidc_policy() -> super::FilterOrPolicy {
 			logout_path: None,
 			post_logout_redirect_uri: None,
 			login_page: None,
+			login_page_path: None,
 		}),
 		..Default::default()
 	}
