@@ -2063,6 +2063,16 @@ async fn convert_mcp_config(
 		ResolvedPolicies::default()
 	};
 
+	let mut gateway_phase_policies = Vec::new();
+	let mut route_inline_policies = Vec::new();
+	for pol in resolved_policies.route_policies {
+		if matches!(&pol, TrafficPolicy::GatewayProof(_)) {
+			gateway_phase_policies.push(pol);
+		} else {
+			route_inline_policies.push(pol);
+		}
+	}
+
 	let mut routes = RouteSet::default();
 	let route = Route {
 		key: route_key.clone(),
@@ -2080,7 +2090,7 @@ async fn convert_mcp_config(
 			backend: BackendReference::Backend(strng::new("/mcp")),
 			inline_policies: resolved_policies.backend_policies,
 		}],
-		inline_policies: resolved_policies.route_policies,
+		inline_policies: route_inline_policies,
 	};
 	routes.insert(route);
 
@@ -2091,6 +2101,18 @@ async fn convert_mcp_config(
 		listener_name: strng::new("mcp"),
 		listener_set: None,
 	};
+
+	let mut all_policies = Vec::new();
+	let target = PolicyTarget::Gateway(listener_name.clone().into());
+	for (idx, pol) in gateway_phase_policies.into_iter().enumerate() {
+		all_policies.push(TargetedPolicy {
+			key: strng::format!("mcp-listener/{idx}"),
+			name: None,
+			target: target.clone(),
+			policy: (pol, PolicyPhase::Gateway).into(),
+		});
+	}
+
 	let listener = Listener {
 		key: listener_key,
 		name: listener_name,
@@ -2121,7 +2143,7 @@ async fn convert_mcp_config(
 		.as_backends(local_name(strng::new("mcp")), client)
 		.await?;
 
-	Ok((bind, vec![], backends))
+	Ok((bind, all_policies, backends))
 }
 
 fn detect_bind_protocol(listeners: &ListenerSet) -> BindProtocol {
