@@ -1005,6 +1005,22 @@ struct LocalLLMPolicy {
 
 #[apply(schema_de!)]
 #[derive(Default)]
+pub struct LocalGatewayProofConfig {
+	#[serde(default = "default_private_key_env")]
+	pub private_key_env: String,
+	#[serde(default = "default_proof_ttl")]
+	pub ttl_seconds: u64,
+}
+
+fn default_private_key_env() -> String {
+	"GATEWAY_PROOF_PRIVATE_KEY".to_string()
+}
+fn default_proof_ttl() -> u64 {
+	60
+}
+
+#[apply(schema_de!)]
+#[derive(Default)]
 struct LocalGatewayPolicy {
 	/// Authenticate incoming browser requests with OIDC authorization code flow.
 	#[serde(default)]
@@ -1032,6 +1048,9 @@ struct LocalGatewayPolicy {
 	/// Authenticate incoming requests using API Keys
 	#[serde(default)]
 	api_key: Option<crate::http::apikey::LocalAPIKeys>,
+	/// RS256 proof signing for downstream services.
+	#[serde(default, rename = "gatewayProof")]
+	gateway_proof: Option<LocalGatewayProofConfig>,
 }
 
 impl From<LocalGatewayPolicy> for FilterOrPolicy {
@@ -1044,6 +1063,7 @@ impl From<LocalGatewayPolicy> for FilterOrPolicy {
 			transformations,
 			basic_auth,
 			api_key,
+			gateway_proof,
 		} = val;
 		FilterOrPolicy {
 			oidc,
@@ -1053,6 +1073,7 @@ impl From<LocalGatewayPolicy> for FilterOrPolicy {
 			transformations,
 			basic_auth,
 			api_key,
+			gateway_proof,
 			..Default::default()
 		}
 	}
@@ -1343,6 +1364,10 @@ pub struct FilterOrPolicy {
 	/// Handle CSRF protection by validating request origins against configured allowed origins.
 	#[serde(default)]
 	csrf: Option<http::csrf::Csrf>,
+
+	/// RS256 proof signing for downstream services.
+	#[serde(default, rename = "gatewayProof")]
+	gateway_proof: Option<LocalGatewayProofConfig>,
 
 	// TrafficPolicy
 	/// Timeout requests that exceed the configured duration.
@@ -2435,6 +2460,7 @@ pub(crate) async fn split_policies(
 		api_key,
 		transformations,
 		csrf,
+		gateway_proof,
 		ext_authz,
 		ext_proc,
 		timeout,
@@ -2540,6 +2566,12 @@ pub(crate) async fn split_policies(
 	}
 	if let Some(p) = ext_proc {
 		route_policies.push(TrafficPolicy::ExtProc(p))
+	}
+	if let Some(gp_config) = gateway_proof {
+		let key_pem = std::env::var(&gp_config.private_key_env)
+			.map_err(|_| anyhow::anyhow!("{} env var not set", gp_config.private_key_env))?;
+		let gp = crate::http::gateway_proof::GatewayProof::new(&key_pem, gp_config.ttl_seconds)?;
+		route_policies.push(TrafficPolicy::GatewayProof(gp));
 	}
 	if !local_rate_limit.is_empty() {
 		route_policies.push(TrafficPolicy::LocalRateLimit(local_rate_limit))

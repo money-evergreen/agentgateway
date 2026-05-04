@@ -260,6 +260,7 @@ pub struct GatewayPolicies {
 	pub transformation: Option<http::transformation_cel::Transformation>,
 	pub basic_auth: Option<http::basicauth::BasicAuthentication>,
 	pub api_key: Option<http::apikey::APIKeyAuthentication>,
+	pub gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 }
 
 impl GatewayPolicies {
@@ -589,6 +590,7 @@ impl Store {
 				TrafficPolicy::CORS(p) => {
 					pol.cors.get_or_insert_with(|| p.clone());
 				},
+				TrafficPolicy::GatewayProof(_) => {},
 			}
 		}
 		if !authz.is_empty() {
@@ -632,6 +634,9 @@ impl Store {
 				},
 				TrafficPolicy::Transformation(p) => {
 					pol.transformation.get_or_insert_with(|| p.clone());
+				},
+				TrafficPolicy::GatewayProof(gp) => {
+					pol.gateway_proof.get_or_insert_with(|| gp.clone());
 				},
 				other => {
 					warn!("unexpected gateway policy: {:?}", other);
