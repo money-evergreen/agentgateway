@@ -2245,8 +2245,18 @@ async fn convert_listener(
 	let mut all_backends = vec![];
 
 	let mut rs = RouteSet::default();
+	let target_for_routes = PolicyTarget::Gateway(name.clone().into());
 	for (idx, l) in routes.into_iter().flatten().enumerate() {
-		let (route, backends) = convert_route(client.clone(), config, l, idx, key.clone()).await?;
+		let (route, gw_policies, backends) =
+			convert_route(client.clone(), config, l, idx, key.clone()).await?;
+		for (pidx, pol) in gw_policies.into_iter().enumerate() {
+			all_policies.push(TargetedPolicy {
+				key: strng::format!("route/{key}/{idx}/gw/{pidx}"),
+				name: None,
+				target: target_for_routes.clone(),
+				policy: (pol, PolicyPhase::Gateway).into(),
+			});
+		}
 		all_backends.extend_from_slice(&backends);
 		rs.insert(route)
 	}
@@ -2296,7 +2306,7 @@ pub async fn convert_route(
 	lr: LocalRoute,
 	idx: usize,
 	listener_key: ListenerKey,
-) -> anyhow::Result<(Route, Vec<BackendWithPolicies>)> {
+) -> anyhow::Result<(Route, Vec<TrafficPolicy>, Vec<BackendWithPolicies>)> {
 	let LocalRoute {
 		name,
 		hostnames,
@@ -2359,7 +2369,15 @@ pub async fn convert_route(
 		br.inline_policies
 			.extend_from_slice(&resolved.backend_policies);
 	}
-	let inline_policies = resolved.route_policies;
+	let mut gateway_phase_policies = Vec::new();
+	let mut inline_policies = Vec::new();
+	for pol in resolved.route_policies {
+		if matches!(&pol, TrafficPolicy::GatewayProof(_)) {
+			gateway_phase_policies.push(pol);
+		} else {
+			inline_policies.push(pol);
+		}
+	}
 	let route = Route {
 		key,
 		service_key: None,
@@ -2374,7 +2392,7 @@ pub async fn convert_route(
 		backends: backend_refs,
 		inline_policies,
 	};
-	Ok((route, external_backends))
+	Ok((route, gateway_phase_policies, external_backends))
 }
 
 #[derive(Default)]

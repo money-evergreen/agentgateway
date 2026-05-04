@@ -609,7 +609,7 @@ impl TestBind {
 	pub async fn attach_route(&mut self, p: serde_json::Value) {
 		let pol: local::LocalRoute = serde_json::from_value(p).unwrap();
 		self.routes += 1;
-		let (route, backends) = local::convert_route(
+		let (route, _gateway_policies, backends) = local::convert_route(
 			self.pi.upstream.clone(),
 			&self.pi.cfg,
 			pol,
