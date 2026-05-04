@@ -1,4 +1,5 @@
 pub mod filters;
+pub mod gateway_proof;
 pub mod health;
 pub mod timeout;
 

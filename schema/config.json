@@ -1296,6 +1296,18 @@
           ],
           "default": null
         },
+        "gatewayProof": {
+          "description": "RS256 Evergreen Internal Token signing. Signs validated JWT claims into X-Gateway-Proof header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalGatewayProofConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "timeout": {
           "description": "Timeout requests that exceed the configured duration.",
           "anyOf": [
@@ -5163,6 +5175,22 @@
       },
       "additionalProperties": false
     },
+    "LocalGatewayProofConfig": {
+      "type": "object",
+      "properties": {
+        "privateKeyEnv": {
+          "description": "Environment variable name containing RS256 private key PEM",
+          "type": "string",
+          "default": "GATEWAY_PROOF_PRIVATE_KEY"
+        },
+        "ttlSeconds": {
+          "description": "Proof token TTL in seconds",
+          "type": "integer",
+          "default": 60
+        }
+      },
+      "additionalProperties": false
+    },
     "LocalGatewayPolicy": {
       "type": "object",
       "properties": {
@@ -5245,6 +5273,18 @@
               "type": "null"
             }
           ]
+        },
+        "gatewayProof": {
+          "description": "RS256 Evergreen Internal Token signing. Signs validated JWT claims into X-Gateway-Proof header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalGatewayProofConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -6332,6 +6372,18 @@
               "type": "null"
             }
           ]
+        },
+        "gatewayProof": {
+          "description": "RS256 Evergreen Internal Token signing. Signs validated JWT claims into X-Gateway-Proof header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalGatewayProofConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "authorization": {
           "description": "Authorization policies for HTTP access.",
