@@ -43,6 +43,7 @@ pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
 	pub policies: McpAuthorizationSet,
 	pub list_cache: Arc<ListCache>,
+	pub gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 }
 
 pub struct RelayInputs {
@@ -50,11 +51,18 @@ pub struct RelayInputs {
 	pub policies: McpAuthorizationSet,
 	pub client: PolicyClient,
 	pub list_cache: Arc<ListCache>,
+	pub gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 }
 
 impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
-		Relay::new(self.backend, self.policies, self.client, self.list_cache)
+		Relay::new(
+			self.backend,
+			self.policies,
+			self.client,
+			self.list_cache,
+			self.gateway_proof,
+		)
 	}
 }
 
@@ -64,11 +72,13 @@ impl Relay {
 		policies: McpAuthorizationSet,
 		client: PolicyClient,
 		list_cache: Arc<ListCache>,
+		gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 	) -> Result<Self, mcp::Error> {
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
 			list_cache,
+			gateway_proof,
 		})
 	}
 	pub fn with_policies(&self, policies: McpAuthorizationSet) -> Self {
@@ -76,6 +86,7 @@ impl Relay {
 			upstreams: self.upstreams.clone(),
 			policies,
 			list_cache: self.list_cache.clone(),
+			gateway_proof: self.gateway_proof.clone(),
 		}
 	}
 

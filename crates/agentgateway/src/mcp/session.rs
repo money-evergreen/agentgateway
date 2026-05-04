@@ -89,7 +89,7 @@ impl Session {
 
 	/// delete any active sessions
 	pub async fn delete_session(&self, parts: Parts) -> Result<Response, ProxyError> {
-		let ctx = IncomingRequestContext::new(&parts);
+		let ctx = IncomingRequestContext::new(&parts, self.relay.gateway_proof.clone());
 		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "delete_session");
 		let session_id = self.id.to_string();
 		log.non_atomic_mutate(|l| {
@@ -146,7 +146,7 @@ impl Session {
 
 	/// get_stream establishes a stream for server-sent messages
 	pub async fn get_stream(&self, parts: Parts) -> Result<Response, ProxyError> {
-		let ctx = IncomingRequestContext::new(&parts);
+		let ctx = IncomingRequestContext::new(&parts, self.relay.gateway_proof.clone());
 		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "get_stream");
 		let session_id = self.id.to_string();
 		log.non_atomic_mutate(|l| {
@@ -201,7 +201,8 @@ impl Session {
 		match message {
 			ClientJsonRpcMessage::Request(mut r) => {
 				let method = r.request.method().to_string();
-				let ctx = IncomingRequestContext::new(&parts);
+				let ctx =
+					IncomingRequestContext::new(&parts, self.relay.gateway_proof.clone());
 				let (mut span, log, cel) = mcp::handler::setup_request_log(parts, &method);
 				let session_id = self.id.to_string();
 				log.non_atomic_mutate(|l| {
@@ -465,7 +466,8 @@ impl Session {
 					ClientNotification::RootsListChangedNotification(r) => r.method.as_str(),
 					ClientNotification::CustomNotification(r) => r.method.as_str(),
 				};
-				let ctx = IncomingRequestContext::new(&parts);
+				let ctx =
+					IncomingRequestContext::new(&parts, self.relay.gateway_proof.clone());
 				let (_span, log, _cel) = mcp::handler::setup_request_log(parts, method);
 				let session_id = self.id.to_string();
 				log.non_atomic_mutate(|l| {

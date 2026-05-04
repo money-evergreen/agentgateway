@@ -1665,6 +1665,7 @@ fn test_openapi_targets_emit_stateless_session_state() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1714,6 +1715,7 @@ fn test_sse_targets_emit_stateless_session_state() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1760,6 +1762,7 @@ async fn test_stdio_targets_remain_non_stateless() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1784,6 +1787,7 @@ async fn test_fanout_deletion_fail_open_skips_failed_upstreams() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1818,6 +1822,7 @@ fn test_set_sessions_matches_by_target_name() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1868,6 +1873,7 @@ fn test_set_sessions_rejects_mismatched_target_set() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1913,6 +1919,7 @@ fn test_merge_initialize_merges_upstream_instructions_when_multiplexing() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -1988,6 +1995,7 @@ fn test_merge_initialize_no_instructions_when_multiplexing() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
@@ -2040,6 +2048,7 @@ fn test_merge_initialize_forwards_single_backend_without_multiplexing() {
 			inputs: setup_proxy_test("{}").unwrap().pi,
 		},
 		test_list_cache(),
+		None,
 	)
 	.unwrap();
 
