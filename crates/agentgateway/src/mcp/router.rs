@@ -76,6 +76,7 @@ impl App {
 		backend_policies: BackendPolicies,
 		mut req: MustSnapshot<'_>,
 		mut log: &mut RequestLog,
+		gateway_proof: Option<GatewayProof>,
 	) -> Result<Response, ProxyError> {
 		let backends = {
 			let binds = self.state.read_binds();
@@ -119,7 +120,6 @@ impl App {
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
 		let authn = backend_policies.mcp_authentication;
-		let gateway_proof = req.extensions().get::<GatewayProof>().cloned();
 		let list_cache = self
 			.list_cache_manager
 			.get_or_create(backend_group_name.name.as_ref());
