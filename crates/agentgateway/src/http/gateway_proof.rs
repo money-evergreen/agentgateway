@@ -46,12 +46,26 @@ impl GatewayProof {
 	}
 
 	pub fn apply(&self, req: &mut Request) -> Result<(), anyhow::Error> {
-		let claims = match req.extensions().get::<Claims>() {
-			Some(c) => c,
+		let inner = match req.extensions().get::<Claims>() {
+			Some(c) => c.inner.clone(),
 			None => return Ok(()),
 		};
+		self.sign_and_set_headers(req.headers_mut(), &inner)
+	}
 
-		let inner = &claims.inner;
+	pub fn apply_with_claims(
+		&self,
+		req: &mut Request,
+		claims: &Claims,
+	) -> Result<(), anyhow::Error> {
+		self.sign_and_set_headers(req.headers_mut(), &claims.inner)
+	}
+
+	fn sign_and_set_headers(
+		&self,
+		headers: &mut http::HeaderMap,
+		inner: &Map<String, Value>,
+	) -> Result<(), anyhow::Error> {
 		let sub = inner
 			.get("sub")
 			.and_then(|v| v.as_str())
@@ -82,7 +96,6 @@ impl GatewayProof {
 		let header = Header::new(Algorithm::RS256);
 		let token = encode(&header, &payload, &self.encoding_key)?;
 
-		let headers = req.headers_mut();
 		headers.insert(self.header_name.clone(), HeaderValue::from_str(&token)?);
 		headers.insert(
 			HeaderName::from_static("x-on-behalf-of"),

@@ -70,14 +70,14 @@ impl IncomingRequestContext {
 		}
 		if let Some(claims) = self.claims.as_ref() {
 			req.extensions_mut().insert(claims.clone());
+			if let Some(gp) = &self.gateway_proof {
+				if let Err(e) = gp.apply_with_claims(req, claims) {
+					warn!("gateway proof signing failed: {e}");
+				}
+			}
 		}
 		if let Some(buffer_limit) = self.buffer_limit.as_ref() {
 			req.extensions_mut().insert(buffer_limit.clone());
-		}
-		if let Some(gp) = &self.gateway_proof {
-			if let Err(e) = gp.apply(req) {
-				warn!("gateway proof signing failed: {e}");
-			}
 		}
 	}
 }
