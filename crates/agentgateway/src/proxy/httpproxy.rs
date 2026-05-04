@@ -279,7 +279,6 @@ async fn apply_gateway_policies(
 	if let Some(gp) = &policies.gateway_proof {
 		gp.apply(req)
 			.map_err(|e| ProxyResponse::from(ProxyError::Processing(e)))?;
-		req.extensions_mut().insert(gp.clone());
 	}
 	if let Some(b) = &policies.basic_auth {
 		b.apply(req).await?;
@@ -575,6 +574,7 @@ impl HTTPProxy {
 			.stores
 			.read_binds()
 			.gateway_policies(&selected_listener.name);
+		let gateway_proof = gateway_policies.gateway_proof.clone();
 		gateway_policies.register_cel_expressions(log.cel.ctx());
 		// This is unfortunate but we record the request twice possibly; we want to record it as early as possible
 		// (for logging, etc) and also after we register the expressions since new fields may be available.
@@ -743,6 +743,7 @@ impl HTTPProxy {
 						backend_policies,
 						response_policies,
 						req,
+						gateway_proof.clone(),
 					)
 					.await;
 			},
@@ -779,6 +780,7 @@ impl HTTPProxy {
 					backend_policies.clone(),
 					response_policies,
 					req,
+					gateway_proof.clone(),
 				)
 				.await;
 			if last || !should_retry(&res, retries.as_ref().unwrap()) {
@@ -956,6 +958,7 @@ impl HTTPProxy {
 		backend_policies: BackendPolicies,
 		response_policies: &mut ResponsePolicies,
 		mut req: Request,
+		gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 	) -> Result<Response, SnapshottedProxyResponse> {
 		if let Some(backend_timeout) = response_policies
 			.timeout
@@ -980,6 +983,7 @@ impl HTTPProxy {
 			MustSnapshot::new(&mut req_opt),
 			Some(log),
 			response_policies,
+			gateway_proof.clone(),
 		);
 
 		// Setup timeout
@@ -1279,6 +1283,7 @@ async fn make_backend_call(
 	mut req: MustSnapshot<'_>,
 	mut log: Option<&mut RequestLog>,
 	response_policies: &mut ResponsePolicies,
+	gateway_proof: Option<crate::http::gateway_proof::GatewayProof>,
 ) -> Result<Response, ProxyResponse> {
 	let policy_client = PolicyClient {
 		inputs: inputs.clone(),
@@ -1446,7 +1451,7 @@ async fn make_backend_call(
 			let res = inputs
 				.clone()
 				.mcp_state
-				.serve(inputs, name, backend, policies, req, log)
+				.serve(inputs, name, backend, policies, req, log, gateway_proof)
 				.await;
 			return res.map_err(ProxyResponse::from);
 		},
@@ -2231,6 +2236,7 @@ impl PolicyClient {
 				// As such, we ensure we ONLY call this with Simple backend type which cannot be MCP/LLM
 				None,
 				&mut Default::default(),
+				None,
 			)
 			.await
 			.map_err(ProxyResponse::downcast)
