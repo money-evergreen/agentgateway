@@ -78,6 +78,10 @@ impl App {
 		mut log: &mut RequestLog,
 		gateway_proof: Option<GatewayProof>,
 	) -> Result<Response, ProxyError> {
+		info!(
+			has_gateway_proof = gateway_proof.is_some(),
+			"MCP serve: gateway_proof received"
+		);
 		let backends = {
 			let binds = self.state.read_binds();
 			let nt = backend

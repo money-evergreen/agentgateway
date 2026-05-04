@@ -575,6 +575,10 @@ impl HTTPProxy {
 			.read_binds()
 			.gateway_policies(&selected_listener.name);
 		let gateway_proof = gateway_policies.gateway_proof.clone();
+		debug!(
+			has_gateway_proof = gateway_proof.is_some(),
+			"proxy_internal: gateway_proof extracted from policies"
+		);
 		gateway_policies.register_cel_expressions(log.cel.ctx());
 		// This is unfortunate but we record the request twice possibly; we want to record it as early as possible
 		// (for logging, etc) and also after we register the expressions since new fields may be available.

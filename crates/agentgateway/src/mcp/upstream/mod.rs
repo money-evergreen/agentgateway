@@ -73,10 +73,21 @@ impl IncomingRequestContext {
 		if let Some(claims) = self.claims.as_ref() {
 			req.extensions_mut().insert(claims.clone());
 			if let Some(gp) = &self.gateway_proof {
+				debug!(
+					sub = claims.inner.get("sub").and_then(|v| v.as_str()).unwrap_or("none"),
+					"ctx.apply: signing gateway proof"
+				);
 				if let Err(e) = gp.apply_with_claims(req, claims) {
 					warn!("gateway proof signing failed: {e}");
 				}
+			} else {
+				debug!("ctx.apply: no gateway_proof signer available");
 			}
+		} else {
+			debug!(
+				has_gateway_proof = self.gateway_proof.is_some(),
+				"ctx.apply: no claims available, skipping proof"
+			);
 		}
 		if let Some(buffer_limit) = self.buffer_limit.as_ref() {
 			req.extensions_mut().insert(buffer_limit.clone());
