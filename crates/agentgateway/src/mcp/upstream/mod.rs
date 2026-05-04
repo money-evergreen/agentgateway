@@ -43,10 +43,12 @@ impl IncomingRequestContext {
 			gateway_proof: None,
 		}
 	}
-	pub fn new(parts: &::http::request::Parts) -> Self {
+	pub fn new(
+		parts: &::http::request::Parts,
+		gateway_proof: Option<GatewayProof>,
+	) -> Self {
 		let claims = parts.extensions.get::<Claims>().cloned();
 		let buffer_limit = parts.extensions.get::<BufferLimit>().cloned();
-		let gateway_proof = parts.extensions.get::<GatewayProof>().cloned();
 		Self {
 			headers: parts.headers.clone(),
 			claims,

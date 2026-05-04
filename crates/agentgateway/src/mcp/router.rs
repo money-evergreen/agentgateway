@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::ProxyInputs;
 use crate::http::authorization::RuleSets;
+use crate::http::gateway_proof::GatewayProof;
 use crate::http::sessionpersistence::Encoder;
 use crate::http::*;
 use crate::mcp::FailureMode;
@@ -118,6 +119,7 @@ impl App {
 			.mcp_authorization
 			.unwrap_or_else(|| McpAuthorizationSet::new(RuleSets::from(Vec::new())));
 		let authn = backend_policies.mcp_authentication;
+		let gateway_proof = req.extensions().get::<GatewayProof>().cloned();
 		let list_cache = self
 			.list_cache_manager
 			.get_or_create(backend_group_name.name.as_ref());
@@ -157,6 +159,7 @@ impl App {
 					policies: authorization_policies.clone(),
 					client: client.clone(),
 					list_cache: list_cache.clone(),
+					gateway_proof: gateway_proof.clone(),
 				},
 			))
 			.await
@@ -174,6 +177,7 @@ impl App {
 					policies: authorization_policies.clone(),
 					client: client.clone(),
 					list_cache: list_cache.clone(),
+					gateway_proof: gateway_proof.clone(),
 				},
 			))
 			.await
@@ -276,6 +280,7 @@ impl App {
 			policies: empty_policies,
 			client,
 			list_cache,
+			gateway_proof: None,
 		}
 		.build_new_connections()?;
 
