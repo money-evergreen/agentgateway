@@ -138,48 +138,15 @@ mod tests {
 	use jsonwebtoken::{DecodingKey, Validation, decode};
 	use serde_json::json;
 
-	const TEST_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDFVIAWtx0FRhiP
-+8cHeEqVi3AqMQPGuju1JNNEU/eZKh6MVLp47SP4vq9jCu3mjUwJbLRyOh1jdmPC
-JXWhiY9F0Il6KcuGihyMc/+Qv0p7yQqYcrzq4iSIweTa1VtRHr3RYKVQXEvhaIFj
-UYFKxccVGjtnRuMZ3RNec8W3oVrJpCP2huC7RWpWorGvQ3jb0M0Zf+7HULMLVbd2
-KhZgxRm/y2ljh1rHrFE4WSzao6iSHyVTqwA8we3JtdzTz7e3ztpXJJfpbHmYBhG7
-evmVUHFGfOqTAF0xo+At8ILqtAFfoH3DiDEuuT1Frx4YD0unJxjxz9UERziRdQxP
-oeFoqclZAgMBAAECggEAFGra2f7WXN5U2kkF3er/ZJvJ3kO2DVDlrqeByJcbjliC
-UqjNpod66ljoksnlta43CN6biRokQk9UoRj5I9602Vdrch1y9pfBvnKeJd71GPvD
-QeTVUURW3WOah13+FdWldE2YrUjvfQIwKROc2hy+rZtKPDRkeR+bynEWKxrh5u0L
-KxjF0v0EZBttp9g6OzXYYaznvbXlDk/BVU/+QD3kkDWIUIa9O+jcZqUS73CI0/zR
-BAw3tI9y/Z/Mdu56cHeglrM6h/t8e6g6xmhhTgaWN0y183WB2H5/CbbB2wRBCnUn
-eNASco/fegQZRakfcN0AuRLjsB+haB/NHheYWlYxVQKBgQD2NhWmd7039LQV0O/t
-R8O5iR54NqXdytT6YL69X2wK026lhlGuOlVsk6tU031hXaqT+FTABcZcagmHfesM
-y9IvLzZionQH02RV+Tazg5KHgaoC5ri/BtU2j2iDIZN6sXvg09MpayFF5OQmi1zu
-ubJbby4OqukCMt4Rk29Eu0G7EwKBgQDNLOhXAKP35i+gsMNw3ulXFWjsJBrQ3Wja
-ytiBuzxpVjeFdPkNcDqHfRizDH4eQu2QiAbxK1lctMZ+FKiz3wkMnuVKLyXhgp0J
-Kk6Nof+X7PUjFszVxtNcjvJ6Q3Dv1PuneHbN5zhMx06ZZ2He6PwF9FtzaAEE4ppB
-OSG4RuzrYwKBgQCMxLNwL/mxamkkKAdlZKiVBb60AJqoynUmifXEFDCTp/sVDEzb
-DmMU5wEISLrg1krWux7JgwO8hqvYGbgv4sDTVW0Ey9kHOGefeBM8Y7d9Xjcz3XI3
-VdLFlQyuHJ5TgfJPwwxyG9w0N//xwbBqlSVSfaiZnkIGjcrFxcPSSjX0nQKBgFn7
-ZfIyH7cqxpyMqUopGODOTPOzaedMEx5Rc96BhR8VZsgq4scX/zNIk7qCshUHeTS3
-04OVZV2ZEqxc1xf7qvZUAW8lelGKfOB2I3lOINA6Zc/7wd3Hkw62ynUAetlT6QIr
-fL8UtsZFap0wj+W4/D6ISks0w62my8vrCHTO9jzNAoGBAL9fs/T9YwxTPCmV5ug3
-AdrvxmTQaoVieQAWuAv1GQ4FKbDPF6L57UQz+y9Gu0n6STWnjKEfQBc3vyIpqM0y
-WrBMUrzRH8zKv/jQLvuD+D6ALP8eQWJTZOXUwC/Sg4yxSzwu4yTE1CP91ZEbMkMR
-0sYO1EDIwP0H1pTnhVCMfwIB
------END PRIVATE KEY-----";
-
-	const TEST_PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxVSAFrcdBUYYj/vHB3hK
-lYtwKjEDxro7tSTTRFP3mSoejFS6eO0j+L6vYwrt5o1MCWy0cjodY3ZjwiV1oYmP
-RdCJeinLhoocjHP/kL9Ke8kKmHK86uIkiMHk2tVbUR690WClUFxL4WiBY1GBSsXH
-FRo7Z0bjGd0TXnPFt6FayaQj9obgu0VqVqKxr0N429DNGX/ux1CzC1W3dioWYMUZ
-v8tpY4dax6xROFks2qOokh8lU6sAPMHtybXc08+3t87aVySX6Wx5mAYRu3r5lVBx
-RnzqkwBdMaPgLfCC6rQBX6B9w4gxLrk9Ra8eGA9LpycY8c/VBEc4kXUMT6HhaKnJ
-WQIDAQAB
------END PUBLIC KEY-----";
+	fn test_keypair() -> (String, String) {
+		let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+		(kp.serialize_pem(), kp.public_key_pem())
+	}
 
 	#[test]
 	fn test_proof_round_trip() {
-		let gp = GatewayProof::new(TEST_PRIV_PEM, 60).unwrap();
+		let (priv_pem, pub_pem) = test_keypair();
+		let gp = GatewayProof::new(&priv_pem, 60).unwrap();
 
 		let mut req = http::Request::builder()
 			.uri("/mcp")
@@ -201,7 +168,7 @@ WQIDAQAB
 			.unwrap()
 			.to_str()
 			.unwrap();
-		let dk = DecodingKey::from_rsa_pem(TEST_PUB_PEM.as_bytes()).unwrap();
+		let dk = DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
 		let mut val = Validation::new(Algorithm::RS256);
 		val.validate_aud = false;
 		val.required_spec_claims = std::collections::HashSet::new();
@@ -216,7 +183,8 @@ WQIDAQAB
 
 	#[test]
 	fn test_no_claims_no_proof() {
-		let gp = GatewayProof::new(TEST_PRIV_PEM, 60).unwrap();
+		let (priv_pem, _) = test_keypair();
+		let gp = GatewayProof::new(&priv_pem, 60).unwrap();
 		let mut req = http::Request::builder()
 			.uri("/mcp")
 			.body(crate::http::Body::empty())
