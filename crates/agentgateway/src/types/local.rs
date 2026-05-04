@@ -2568,10 +2568,18 @@ pub(crate) async fn split_policies(
 		route_policies.push(TrafficPolicy::ExtProc(p))
 	}
 	if let Some(gp_config) = gateway_proof {
+		tracing::info!(
+			env_var = %gp_config.private_key_env,
+			ttl = gp_config.ttl_seconds,
+			"split_policies: gatewayProof config present, loading key"
+		);
 		let key_pem = std::env::var(&gp_config.private_key_env)
 			.map_err(|_| anyhow::anyhow!("{} env var not set", gp_config.private_key_env))?;
 		let gp = crate::http::gateway_proof::GatewayProof::new(&key_pem, gp_config.ttl_seconds)?;
+		tracing::info!("split_policies: GatewayProof created successfully");
 		route_policies.push(TrafficPolicy::GatewayProof(gp));
+	} else {
+		tracing::debug!("split_policies: no gatewayProof config");
 	}
 	if !local_rate_limit.is_empty() {
 		route_policies.push(TrafficPolicy::LocalRateLimit(local_rate_limit))

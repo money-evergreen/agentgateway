@@ -635,17 +635,22 @@ impl Store {
 				TrafficPolicy::Transformation(p) => {
 					pol.transformation.get_or_insert_with(|| p.clone());
 				},
-				TrafficPolicy::GatewayProof(gp) => {
-					pol.gateway_proof.get_or_insert_with(|| gp.clone());
-				},
-				other => {
-					warn!("unexpected gateway policy: {:?}", other);
-				},
-			}
+			TrafficPolicy::GatewayProof(gp) => {
+				info!("gateway_policies: found GatewayProof in gateway-phase policies");
+				pol.gateway_proof.get_or_insert_with(|| gp.clone());
+			},
+			other => {
+				warn!("unexpected gateway policy: {:?}", other);
+			},
 		}
-
-		pol
 	}
+
+	info!(
+		has_gateway_proof = pol.gateway_proof.is_some(),
+		"gateway_policies: resolved"
+	);
+	pol
+}
 
 	// sub_backend_policies looks up the sub-backends policies. Generally, these will be queried separately
 	// from the primary backend policies and then merged, just due to the lifecycle of when the sub-backend
