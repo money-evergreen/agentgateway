@@ -13,6 +13,7 @@ use rmcp::transport::TokioChildProcess;
 use thiserror::Error;
 use tokio::process::Command;
 
+use crate::http::gateway_proof::GatewayProof;
 use crate::http::jwt::Claims;
 use crate::mcp::FailureMode;
 use crate::mcp::mergestream::Messages;
@@ -30,6 +31,7 @@ pub struct IncomingRequestContext {
 	headers: http::HeaderMap,
 	claims: Option<Claims>,
 	buffer_limit: Option<BufferLimit>,
+	gateway_proof: Option<GatewayProof>,
 }
 
 impl IncomingRequestContext {
@@ -38,15 +40,18 @@ impl IncomingRequestContext {
 			headers: http::HeaderMap::new(),
 			claims: None,
 			buffer_limit: None,
+			gateway_proof: None,
 		}
 	}
 	pub fn new(parts: &::http::request::Parts) -> Self {
 		let claims = parts.extensions.get::<Claims>().cloned();
 		let buffer_limit = parts.extensions.get::<BufferLimit>().cloned();
+		let gateway_proof = parts.extensions.get::<GatewayProof>().cloned();
 		Self {
 			headers: parts.headers.clone(),
 			claims,
 			buffer_limit,
+			gateway_proof,
 		}
 	}
 	pub fn apply(&self, req: &mut http::Request) {
@@ -68,6 +73,11 @@ impl IncomingRequestContext {
 		}
 		if let Some(buffer_limit) = self.buffer_limit.as_ref() {
 			req.extensions_mut().insert(buffer_limit.clone());
+		}
+		if let Some(gp) = &self.gateway_proof {
+			if let Err(e) = gp.apply(req) {
+				warn!("gateway proof signing failed: {e}");
+			}
 		}
 	}
 }

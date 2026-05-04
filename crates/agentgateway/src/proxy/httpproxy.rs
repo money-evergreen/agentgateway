@@ -279,6 +279,7 @@ async fn apply_gateway_policies(
 	if let Some(gp) = &policies.gateway_proof {
 		gp.apply(req)
 			.map_err(|e| ProxyResponse::from(ProxyError::Processing(e)))?;
+		req.extensions_mut().insert(gp.clone());
 	}
 	if let Some(b) = &policies.basic_auth {
 		b.apply(req).await?;
