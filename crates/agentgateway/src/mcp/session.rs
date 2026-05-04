@@ -220,7 +220,7 @@ impl Session {
 						let pv = ir.params.protocol_version.clone();
 						let res = self
 							.relay
-							.send_fanout(
+							.send_fanout_tolerant(
 								r,
 								ctx,
 								self
