@@ -64,13 +64,17 @@ async fn fetch_scopes(config: &EnduserScopeSource) -> anyhow::Result<Vec<String>
 		.map_err(|_| anyhow::anyhow!("env var {} not set", config.client_secret_env))?;
 
 	let http = reqwest::Client::new();
+	let mut params = vec![
+		("grant_type".to_string(), "client_credentials".to_string()),
+		("client_id".to_string(), client_id),
+		("client_secret".to_string(), client_secret),
+	];
+	if !config.scopes.is_empty() {
+		params.push(("scope".to_string(), config.scopes.join(" ")));
+	}
 	let resp = http
 		.post(&config.token_endpoint)
-		.form(&[
-			("grant_type", "client_credentials"),
-			("client_id", &client_id),
-			("client_secret", &client_secret),
-		])
+		.form(&params)
 		.send()
 		.await?;
 
