@@ -1791,6 +1791,12 @@
             "refreshIntervalSecs": {
               "type": "integer",
               "default": 300
+            },
+            "scopes": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "OAuth scopes to request in the Client Credentials grant. Required when the authorization server has no default scopes configured."
             }
           },
           "additionalProperties": false

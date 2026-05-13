@@ -21,6 +21,8 @@ pub struct EnduserScopeSource {
 	pub token_endpoint: String,
 	pub client_id_env: String,
 	pub client_secret_env: String,
+	#[serde(default)]
+	pub scopes: Vec<String>,
 	#[serde(default = "default_refresh_interval")]
 	pub refresh_interval_secs: u64,
 }
