@@ -85,6 +85,9 @@ async fn test_mcp_auth(idp_issuer: &str, proxy_client_id: &str) -> McpAuthentica
 		},
 		jwt_validator: Arc::new(validator),
 		mode: McpAuthenticationMode::Strict,
+		fallback_validators: vec![],
+		enduser_scope_source: None,
+		scope_cache: None,
 		oidc_proxy: Some(OidcProxyConfig {
 			client_id: proxy_client_id.to_string(),
 			client_secret: secrecy::SecretString::new("gateway-secret".into()),
@@ -124,6 +127,9 @@ fn test_mcp_auth_no_proxy(idp_issuer: &str) -> McpAuthentication {
 		},
 		jwt_validator: Arc::new(validator),
 		mode: McpAuthenticationMode::Strict,
+		fallback_validators: vec![],
+		enduser_scope_source: None,
+		scope_cache: None,
 		oidc_proxy: None,
 	}
 }

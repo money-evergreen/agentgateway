@@ -1738,6 +1738,62 @@
               "exp"
             ]
           }
+        },
+        "fallbackValidators": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["publicKeyEnv", "audiences", "claimsMapping"],
+            "properties": {
+              "publicKeyEnv": {
+                "type": "string",
+                "description": "Environment variable name containing RSA public key PEM"
+              },
+              "audiences": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "claimsMapping": {
+                "type": "object",
+                "required": ["sub", "authType"],
+                "properties": {
+                  "sub": {
+                    "type": "string",
+                    "description": "Dot-notation path to extract sub from JWT claims"
+                  },
+                  "authType": {
+                    "type": "string",
+                    "description": "Value to set as _auth_type in gateway proof"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": []
+        },
+        "enduserScopeSource": {
+          "type": "object",
+          "required": ["tokenEndpoint", "clientIdEnv", "clientSecretEnv"],
+          "properties": {
+            "tokenEndpoint": {
+              "type": "string"
+            },
+            "clientIdEnv": {
+              "type": "string"
+            },
+            "clientSecretEnv": {
+              "type": "string"
+            },
+            "refreshIntervalSecs": {
+              "type": "integer",
+              "default": 300
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false,

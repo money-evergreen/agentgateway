@@ -337,7 +337,7 @@ pub async fn test_apply_strict_missing_token() {
 	// Minimal RequestLog
 	let mut req_log = make_min_req_log();
 
-	let res = jwt.apply(Some(&mut req_log), &mut req).await;
+	let res = jwt.apply(Some(&mut req_log), &mut req, &[], None).await;
 	assert!(matches!(res, Err(super::TokenError::Missing)));
 }
 
@@ -351,7 +351,7 @@ pub async fn test_apply_permissive_no_token_ok() {
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(res.is_ok());
 	assert!(req.extensions().get::<super::Claims>().is_none());
 }
@@ -370,7 +370,7 @@ pub async fn test_apply_permissive_invalid_token_ok_and_keeps_header() {
 		crate::http::HeaderValue::from_static("Bearer invalid-token"),
 	);
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(res.is_ok());
 	// Header should remain present on failure in permissive mode
 	assert!(
@@ -403,7 +403,7 @@ pub async fn test_apply_permissive_valid_token_inserts_claims_and_removes_header
 		crate::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
 	);
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(res.is_ok());
 	assert!(
 		req
@@ -424,7 +424,7 @@ pub async fn test_apply_optional_no_token_ok() {
 	};
 	let mut req = crate::http::Request::new(crate::http::Body::empty());
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(res.is_ok());
 	assert!(req.extensions().get::<super::Claims>().is_none());
 }
@@ -443,7 +443,7 @@ pub async fn test_apply_optional_invalid_token_err() {
 		crate::http::HeaderValue::from_static("Bearer invalid-token"),
 	);
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(matches!(res, Err(TokenError::InvalidHeader(_))));
 }
 
@@ -467,7 +467,7 @@ pub async fn test_apply_optional_valid_token_inserts_claims_and_removes_header()
 		crate::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
 	);
 	let mut log = make_min_req_log();
-	let res = jwt.apply(Some(&mut log), &mut req).await;
+	let res = jwt.apply(Some(&mut log), &mut req, &[], None).await;
 	assert!(res.is_ok());
 	assert!(
 		req
@@ -862,4 +862,213 @@ pub fn test_required_claims_with_nbf_rejects_missing_nbf() {
 		result.is_err(),
 		"required_claims with nbf should reject tokens missing nbf claim"
 	);
+}
+
+// --- Fallback validator tests ---
+
+use crate::types::fallback::{ClaimsMapping, FallbackValidator};
+
+fn make_rsa_keypair() -> (String, String) {
+	let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+	(kp.serialize_pem(), kp.public_key_pem())
+}
+
+fn mint_test_jwt(private_pem: &str, claims: &serde_json::Value) -> String {
+	let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes()).unwrap();
+	let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+	jsonwebtoken::encode(&header, claims, &key).unwrap()
+}
+
+fn empty_jwt() -> Jwt {
+	Jwt {
+		mode: Mode::Strict,
+		providers: vec![],
+	}
+}
+
+#[tokio::test]
+async fn test_fallback_extracts_sub_and_auth_type() {
+	let (priv_pem, pub_pem) = make_rsa_keypair();
+	let env_key = "TEST_FALLBACK_SUB_AUTH";
+	unsafe { std::env::set_var(env_key, &pub_pem) };
+
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let token = mint_test_jwt(
+		&priv_pem,
+		&json!({
+			"aud": "evergreen-app",
+			"iss": "test-issuer",
+			"exp": now + 600,
+			"profile": { "evergreenUserId": "eg-user-test" }
+		}),
+	);
+
+	let validators = vec![FallbackValidator {
+		public_key_env: env_key.to_string(),
+		audiences: vec!["evergreen-app".to_string()],
+		claims_mapping: ClaimsMapping {
+			sub: "profile.evergreenUserId".to_string(),
+			auth_type: "enduser_jwt".to_string(),
+		},
+	}];
+
+	let jwt = empty_jwt();
+	let claims = jwt
+		.validate_with_fallback(&token, &validators, None)
+		.await
+		.expect("fallback should succeed");
+
+	assert_eq!(claims.inner["sub"], "eg-user-test");
+	assert_eq!(claims.inner["_auth_type"], "enduser_jwt");
+}
+
+#[tokio::test]
+async fn test_fallback_wrong_audience_rejected() {
+	let (priv_pem, pub_pem) = make_rsa_keypair();
+	let env_key = "TEST_FALLBACK_WRONG_AUD";
+	unsafe { std::env::set_var(env_key, &pub_pem) };
+
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let token = mint_test_jwt(
+		&priv_pem,
+		&json!({
+			"aud": "wrong-audience",
+			"iss": "test-issuer",
+			"exp": now + 600,
+			"profile": { "evergreenUserId": "eg-user-test" }
+		}),
+	);
+
+	let validators = vec![FallbackValidator {
+		public_key_env: env_key.to_string(),
+		audiences: vec!["evergreen-app".to_string()],
+		claims_mapping: ClaimsMapping {
+			sub: "profile.evergreenUserId".to_string(),
+			auth_type: "enduser_jwt".to_string(),
+		},
+	}];
+
+	let jwt = empty_jwt();
+	let result = jwt.validate_with_fallback(&token, &validators, None).await;
+	assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_fallback_wrong_key_rejected() {
+	let (priv_pem, _) = make_rsa_keypair();
+	let (_, other_pub_pem) = make_rsa_keypair();
+	let env_key = "TEST_FALLBACK_WRONG_KEY";
+	unsafe { std::env::set_var(env_key, &other_pub_pem) };
+
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let token = mint_test_jwt(
+		&priv_pem,
+		&json!({
+			"aud": "evergreen-app",
+			"iss": "test-issuer",
+			"exp": now + 600,
+		}),
+	);
+
+	let validators = vec![FallbackValidator {
+		public_key_env: env_key.to_string(),
+		audiences: vec!["evergreen-app".to_string()],
+		claims_mapping: ClaimsMapping {
+			sub: "sub".to_string(),
+			auth_type: "enduser_jwt".to_string(),
+		},
+	}];
+
+	let jwt = empty_jwt();
+	let result = jwt.validate_with_fallback(&token, &validators, None).await;
+	assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_fallback_expired_rejected() {
+	let (priv_pem, pub_pem) = make_rsa_keypair();
+	let env_key = "TEST_FALLBACK_EXPIRED";
+	unsafe { std::env::set_var(env_key, &pub_pem) };
+
+	let token = mint_test_jwt(
+		&priv_pem,
+		&json!({
+			"aud": "evergreen-app",
+			"iss": "test-issuer",
+			"exp": 0,
+		}),
+	);
+
+	let validators = vec![FallbackValidator {
+		public_key_env: env_key.to_string(),
+		audiences: vec!["evergreen-app".to_string()],
+		claims_mapping: ClaimsMapping {
+			sub: "sub".to_string(),
+			auth_type: "enduser_jwt".to_string(),
+		},
+	}];
+
+	let jwt = empty_jwt();
+	let result = jwt.validate_with_fallback(&token, &validators, None).await;
+	assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_jwks_success_skips_fallback() {
+	let (jwt, kid, issuer, allowed_aud) = setup_test_jwt();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	let token = build_unsigned_token(kid, issuer, allowed_aud, now + 600);
+
+	let validators = vec![FallbackValidator {
+		public_key_env: "SHOULD_NOT_BE_READ".to_string(),
+		audiences: vec!["evergreen-app".to_string()],
+		claims_mapping: ClaimsMapping {
+			sub: "profile.evergreenUserId".to_string(),
+			auth_type: "enduser_jwt".to_string(),
+		},
+	}];
+
+	let claims = jwt
+		.validate_with_fallback(&token, &validators, None)
+		.await
+		.expect("JWKS should succeed, skipping fallback");
+
+	assert!(claims.inner.get("_auth_type").is_none());
+}
+
+#[test]
+fn test_extract_nested_helper() {
+	use super::extract_nested;
+	use serde_json::json;
+
+	let map: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+		"profile": {
+			"evergreenUserId": "eg-user-123"
+		},
+		"sub": "direct-sub"
+	}))
+	.unwrap();
+
+	assert_eq!(
+		extract_nested(&map, "profile.evergreenUserId"),
+		Some("eg-user-123".to_string())
+	);
+	assert_eq!(
+		extract_nested(&map, "sub"),
+		Some("direct-sub".to_string())
+	);
+	assert_eq!(extract_nested(&map, "nonexistent.path"), None);
+	assert_eq!(extract_nested(&map, "profile.missing"), None);
 }

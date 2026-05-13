@@ -2,6 +2,7 @@ pub mod agent;
 mod agent_xds;
 pub mod backend;
 pub mod discovery;
+pub mod fallback;
 pub mod frontend;
 pub mod loadbalancer;
 pub mod local;
