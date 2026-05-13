@@ -1,6 +1,7 @@
 pub mod filters;
 pub mod gateway_proof;
 pub mod health;
+pub mod scope_cache;
 pub mod timeout;
 
 mod buflist;

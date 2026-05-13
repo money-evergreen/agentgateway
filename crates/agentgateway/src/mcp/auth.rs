@@ -401,7 +401,7 @@ pub(super) async fn apply_token_validation(
 		"MCP auth configured; validating Authorization header (mode={:?})",
 		auth.mode
 	);
-	auth.jwt_validator.apply(None, req).await.map_err(|e| {
+	auth.jwt_validator.apply(None, req, &[], None).await.map_err(|e| {
 		create_auth_required_response(ProxyError::JwtAuthenticationFailure(e), req, auth)
 	})?;
 	Ok(())
@@ -1088,6 +1088,9 @@ mod tests {
 			),
 			mode: crate::types::agent::McpAuthenticationMode::Strict,
 			oidc_proxy: None,
+			fallback_validators: vec![],
+			enduser_scope_source: None,
+			scope_cache: None,
 		}
 	}
 

@@ -83,7 +83,11 @@ impl GatewayProof {
 			obo,
 			cid,
 			iby: String::new(),
-			auth_type: "okta_token".to_string(),
+			auth_type: inner
+			.get("_auth_type")
+			.and_then(|v| v.as_str())
+			.unwrap_or("okta_token")
+			.to_string(),
 			ent: EntClaim {
 				scopes: scp,
 				roles: vec![],
@@ -204,5 +208,41 @@ mod tests {
 			.unwrap();
 		gp.apply(&mut req).unwrap();
 		assert!(req.headers().get("x-gateway-proof").is_none());
+	}
+
+	#[test]
+	fn test_proof_with_enduser_auth_type() {
+		let (priv_pem, pub_pem) = test_keypair();
+		let gp = GatewayProof::new(&priv_pem, 60).unwrap();
+
+		let mut req = http::Request::builder()
+			.uri("/mcp")
+			.body(crate::http::Body::empty())
+			.unwrap();
+		let claims_map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+			r#"{"sub":"eg-user-123","scp":["read"],"_auth_type":"enduser_jwt"}"#,
+		)
+		.unwrap();
+		let claims = Claims {
+			inner: claims_map,
+			jwt: secrecy::SecretString::new("test-token".into()),
+		};
+		req.extensions_mut().insert(claims);
+
+		gp.apply(&mut req).unwrap();
+
+		let proof = req
+			.headers()
+			.get("x-gateway-proof")
+			.unwrap()
+			.to_str()
+			.unwrap();
+		let dk = DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
+		let mut val = Validation::new(Algorithm::RS256);
+		val.validate_aud = false;
+		val.required_spec_claims = std::collections::HashSet::new();
+		let decoded = decode::<serde_json::Value>(proof, &dk, &val).unwrap();
+		assert_eq!(decoded.claims["_auth_type"], "enduser_jwt");
+		assert_eq!(decoded.claims["sub"], "eg-user-123");
 	}
 }

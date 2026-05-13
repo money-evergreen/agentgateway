@@ -2147,9 +2147,18 @@ impl JwtAuthentication {
 		log: Option<&mut crate::telemetry::log::RequestLog>,
 		req: &mut crate::http::Request,
 	) -> Result<(), crate::proxy::ProxyResponse> {
+		let fallback_validators = self
+			.mcp
+			.as_ref()
+			.map_or(&[][..], |m| &m.fallback_validators);
+		let scope_cache = self
+			.mcp
+			.as_ref()
+			.and_then(|m| m.scope_cache.as_ref());
+
 		if let Some(auth) = &self.mcp {
 			if !crate::mcp::auth::is_oauth_bootstrap_path(req.uri().path()) {
-				self.jwt.apply(log, req).await.map_err(|e| {
+				self.jwt.apply(log, req, fallback_validators, scope_cache).await.map_err(|e| {
 					crate::proxy::ProxyResponse::from(crate::mcp::auth::create_auth_required_response(
 						crate::proxy::ProxyError::JwtAuthenticationFailure(e),
 						req,
@@ -2166,7 +2175,7 @@ impl JwtAuthentication {
 
 		self
 			.jwt
-			.apply(log, req)
+			.apply(log, req, fallback_validators, scope_cache)
 			.await
 			.map_err(crate::proxy::ProxyError::JwtAuthenticationFailure)
 			.map_err(crate::proxy::ProxyResponse::from)?;
@@ -2185,6 +2194,12 @@ pub struct McpAuthentication {
 	pub mode: McpAuthenticationMode,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub oidc_proxy: Option<OidcProxyConfig>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub fallback_validators: Vec<crate::types::fallback::FallbackValidator>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enduser_scope_source: Option<crate::types::fallback::EnduserScopeSource>,
+	#[serde(skip)]
+	pub scope_cache: Option<crate::http::scope_cache::ScopeCache>,
 }
 
 /// Gateway's own OAuth2 client credentials with the downstream IDP,
@@ -2240,6 +2255,10 @@ pub struct LocalMcpAuthentication {
 	pub jwt_validation_options: http::jwt::JWTValidationOptions,
 	#[serde(default)]
 	pub oidc_proxy: Option<LocalOidcProxyConfig>,
+	#[serde(default)]
+	pub fallback_validators: Vec<crate::types::fallback::FallbackValidator>,
+	#[serde(default)]
+	pub enduser_scope_source: Option<crate::types::fallback::EnduserScopeSource>,
 }
 
 /// Local (file-based) configuration for the OIDC proxy credentials.
@@ -2399,6 +2418,10 @@ impl LocalMcpAuthentication {
 			},
 			None => None,
 		};
+		let scope_cache = match &self.enduser_scope_source {
+			Some(cfg) => Some(crate::http::scope_cache::ScopeCache::new(cfg.clone()).await),
+			None => None,
+		};
 		Ok(McpAuthentication {
 			issuer: self.issuer.clone(),
 			audiences: self.audiences.clone(),
@@ -2407,6 +2430,9 @@ impl LocalMcpAuthentication {
 			jwt_validator: Arc::new(jwt),
 			mode: self.mode,
 			oidc_proxy,
+			fallback_validators: self.fallback_validators.clone(),
+			enduser_scope_source: self.enduser_scope_source.clone(),
+			scope_cache,
 		})
 	}
 }

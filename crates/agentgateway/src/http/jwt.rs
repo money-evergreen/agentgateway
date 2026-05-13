@@ -394,6 +394,8 @@ impl Jwt {
 		&self,
 		log: Option<&mut RequestLog>,
 		req: &mut Request,
+		fallback_validators: &[crate::types::fallback::FallbackValidator],
+		scope_cache: Option<&crate::http::scope_cache::ScopeCache>,
 	) -> Result<(), TokenError> {
 		let Ok(TypedHeader(Authorization(bearer))) = req
 			.extract_parts::<TypedHeader<Authorization<Bearer>>>()
@@ -406,7 +408,7 @@ impl Jwt {
 			// Otherwise with no, don't attempt to authenticate.
 			return Ok(());
 		};
-		let claims = match self.validate_claims(bearer.token()) {
+		let claims = match self.validate_with_fallback(bearer.token(), fallback_validators, scope_cache).await {
 			Ok(claims) => claims,
 			Err(e) if self.mode == Mode::Permissive => {
 				debug!("token verification failed ({e}), continue due to permissive mode");
@@ -462,4 +464,91 @@ impl Jwt {
 		};
 		Ok(claims)
 	}
+
+	pub async fn validate_with_fallback(
+		&self,
+		token: &str,
+		fallback_validators: &[crate::types::fallback::FallbackValidator],
+		scope_cache: Option<&crate::http::scope_cache::ScopeCache>,
+	) -> Result<Claims, TokenError> {
+		match self.validate_claims(token) {
+			Ok(claims) => Ok(claims),
+			Err(primary_error) if fallback_validators.is_empty() => Err(primary_error),
+			Err(primary_error) => {
+				for validator in fallback_validators {
+					debug!(validator = %validator.public_key_env, "trying fallback validator");
+
+					let pem = match std::env::var(&validator.public_key_env) {
+						Ok(v) => v,
+						Err(_) => {
+							debug!(env = %validator.public_key_env, "fallback env var not set, skipping");
+							continue;
+						},
+					};
+
+					let decoding_key = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
+						Ok(k) => k,
+						Err(e) => {
+							warn!(error = ?e, env = %validator.public_key_env, "failed to parse fallback PEM");
+							continue;
+						},
+					};
+
+					let mut validation = Validation::new(Algorithm::RS256);
+					validation.set_audience(&validator.audiences);
+
+					let decoded = match decode::<Map<String, Value>>(token, &decoding_key, &validation) {
+						Ok(d) => d,
+						Err(e) => {
+							debug!(error = ?e, validator = %validator.public_key_env, "fallback validation failed");
+							continue;
+						},
+					};
+
+					let mut claims_map = decoded.claims;
+
+					if let Some(extracted_sub) = extract_nested(&claims_map, &validator.claims_mapping.sub) {
+						claims_map.insert("sub".to_string(), Value::String(extracted_sub));
+					}
+
+					claims_map.insert(
+						"_auth_type".to_string(),
+						Value::String(validator.claims_mapping.auth_type.clone()),
+					);
+
+					if let Some(cache) = scope_cache {
+						let scopes = cache.get_scopes().await;
+						claims_map.insert(
+							"scp".to_string(),
+							Value::Array(scopes.into_iter().map(Value::String).collect()),
+						);
+					}
+
+					info!(auth_type = %validator.claims_mapping.auth_type, "fallback validation succeeded");
+					return Ok(Claims {
+						inner: claims_map,
+						jwt: SecretString::new(token.into()),
+					});
+				}
+
+				Err(primary_error)
+			},
+		}
+	}
+}
+
+fn extract_nested(map: &Map<String, Value>, path: &str) -> Option<String> {
+	let parts: Vec<&str> = path.split('.').collect();
+	let mut current: &Value = &Value::Object(map.clone());
+
+	for part in &parts {
+		match current {
+			Value::Object(obj) => {
+				current = obj.get(*part)?;
+			},
+			_ => return None,
+		}
+	}
+
+	current.as_str().map(String::from)
 }

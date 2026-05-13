@@ -291,6 +291,9 @@ fn build_mcp_authentication(
 		jwt_validator,
 		mode,
 		oidc_proxy: None,
+		fallback_validators: vec![],
+		enduser_scope_source: None,
+		scope_cache: None,
 	}
 }
 
