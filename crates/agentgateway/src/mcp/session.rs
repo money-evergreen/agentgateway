@@ -367,35 +367,32 @@ impl Session {
 						self.relay.send_single(r, ctx, service_name, None).await
 					},
 					ClientRequest::ReadResourceRequest(rrr) => {
-						if let Some(service_name) = self.relay.default_target_name() {
-							let uri = rrr.params.uri.clone();
-							span.rename_span(format!("{method} {service_name}"));
-							log.non_atomic_mutate(|l| {
-								l.set_resource(service_name.to_string(), uri.to_string());
-							});
-							if !self.relay.policies.validate(
-								&rbac::ResourceType::Resource(rbac::ResourceId::new(
-									service_name.to_string(),
-									uri.to_string(),
-								)),
-								&cel,
-							) {
-								return Err(UpstreamError::Authorization {
-									resource_type: "resource".to_string(),
-									resource_name: uri.to_string(),
-								});
-							}
-							self
-								.relay
-								.send_single_without_multiplexing(r, ctx, None)
-								.await
+						let uri = rrr.params.uri.clone();
+						let service_name = if let Some(name) = self.relay.default_target_name() {
+							name
 						} else {
-							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
-							// Find a mapping of URL
-							Err(UpstreamError::InvalidMethodWithMultiplexing(
-								r.request.method().to_string(),
-							))
+							self.relay.resolve_resource_target(&uri)?
+						};
+						span.rename_span(format!("{method} {service_name}"));
+						log.non_atomic_mutate(|l| {
+							l.set_resource(service_name.to_string(), uri.to_string());
+						});
+						if !self.relay.policies.validate(
+							&rbac::ResourceType::Resource(rbac::ResourceId::new(
+								service_name.to_string(),
+								uri.to_string(),
+							)),
+							&cel,
+						) {
+							return Err(UpstreamError::Authorization {
+								resource_type: "resource".to_string(),
+								resource_name: uri.to_string(),
+							});
 						}
+						self
+							.relay
+							.send_single(r, ctx, &service_name, None)
+							.await
 					},
 
 				ClientRequest::CustomRequest(cr)
