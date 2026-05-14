@@ -6,6 +6,7 @@ use crate::http::Response;
 use crate::http::sessionpersistence::MCPSession;
 use crate::mcp;
 use crate::mcp::FailureMode;
+use crate::mcp::list_cache;
 use crate::mcp::list_cache::ListCache;
 use crate::mcp::mergestream::{MergeFn, Messages};
 use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
@@ -166,6 +167,30 @@ impl Relay {
 	}
 	pub fn default_target_name(&self) -> Option<String> {
 		self.upstreams.default_target_name.clone()
+	}
+
+	/// Resolve which backend target owns the given resource URI by scanning
+	/// the cached `resources/list` results.
+	pub fn resolve_resource_target(&self, uri: &str) -> Result<String, UpstreamError> {
+		let raw = self
+			.list_cache
+			.get_raw(list_cache::RESOURCES_LIST)
+			.ok_or_else(|| {
+				UpstreamError::InvalidRequest(
+					"resources/list has not been called yet; cannot resolve resource URI"
+						.to_string(),
+				)
+			})?;
+		for (server_name, result) in &raw {
+			if let ServerResult::ListResourcesResult(lrr) = result
+				&& lrr.resources.iter().any(|r| r.uri == uri)
+			{
+				return Ok(server_name.to_string());
+			}
+		}
+		Err(UpstreamError::InvalidRequest(format!(
+			"no backend owns resource URI: {uri}"
+		)))
 	}
 
 	pub fn caching_merge(&self, method: &str, inner: Box<MergeFn>) -> Box<MergeFn> {

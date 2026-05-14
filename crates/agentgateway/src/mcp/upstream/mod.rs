@@ -106,6 +106,7 @@ pub enum UpstreamError {
 	InvalidRequest(String),
 	#[error("unsupported method: {0}")]
 	InvalidMethod(String),
+	#[allow(dead_code)]
 	#[error("method {0} is unsupported with multiplexing")]
 	InvalidMethodWithMultiplexing(String),
 	#[error("stdio upstream error: {0}")]
